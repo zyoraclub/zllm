@@ -228,15 +228,91 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
             response = llm.chat(prompt, system_prompt=system)
             console.print(response)
     else:
-        # Interactive chat mode
-        spec_info = f"\n[dim]Speculative: {draft_model_id}[/dim]" if draft_model_id else ""
+        # Interactive chat mode - show ZLLM branding and info
+        console.print()
+        
+        # ZLLM Banner
+        banner = """
+[bold cyan]╔═══════════════════════════════════════════════════════════════════════════╗
+║                                                                               ║
+║    ███████╗██╗     ██╗     ███╗   ███╗                                       ║
+║    ╚══███╔╝██║     ██║     ████╗ ████║                                       ║
+║      ███╔╝ ██║     ██║     ██╔████╔██║     Memory-Efficient LLM Engine       ║
+║     ███╔╝  ██║     ██║     ██║╚██╔╝██║     "7B models on 2-3GB VRAM"         ║
+║    ███████╗███████╗███████╗██║ ╚═╝ ██║                                       ║
+║    ╚══════╝╚══════╝╚══════╝╚═╝     ╚═╝                                       ║
+║                                                                               ║
+╚═══════════════════════════════════════════════════════════════════════════════╝[/bold cyan]
+"""
+        console.print(banner)
+        
+        # Model Info Table
+        info_table = Table(show_header=False, box=None, padding=(0, 2))
+        info_table.add_column("Key", style="dim")
+        info_table.add_column("Value", style="green")
+        
+        info_table.add_row("📦 Model", model_id)
+        info_table.add_row("🎯 Parameters", f"{llm.model_info.params_billions:.1f}B" if llm.model_info else "Unknown")
+        info_table.add_row("⚡ Speed Mode", llm.memory_manager.speed_mode.value if llm.memory_manager else speed)
+        
+        # Quantization info
+        quant = llm._load_constraints.get("applied_quantization") if hasattr(llm, '_load_constraints') else None
+        info_table.add_row("🗜️  Quantization", quant or "None (FP16)")
+        
+        if draft_model_id:
+            info_table.add_row("🚀 Draft Model", draft_model_id)
+        
+        console.print(info_table)
+        console.print()
+        
+        # GPU Memory Status
+        try:
+            import torch
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                gpu_name = torch.cuda.get_device_name(0)
+                
+                mem_table = Table(show_header=False, box=None, padding=(0, 2))
+                mem_table.add_column("Key", style="dim")
+                mem_table.add_column("Value")
+                
+                mem_table.add_row("🖥️  GPU", gpu_name)
+                mem_table.add_row("💾 VRAM", f"{allocated:.1f}GB / {total:.1f}GB  {get_memory_bar(allocated, total)}")
+                
+                console.print(mem_table)
+                console.print()
+        except Exception:
+            pass
+        
+        # Active Features
+        features = []
+        if llm.orchestrator:
+            features.append("[cyan]🧠 Intelligent Orchestrator[/cyan]")
+        if llm.kv_cache_manager:
+            features.append("[cyan]💾 INT8 KV Cache[/cyan]")
+        if llm.flash_attention_config:
+            features.append(f"[cyan]⚡ Flash Attention ({llm.flash_attention_config.get('backend', 'enabled')})[/cyan]")
+        if llm.speculative_decoder:
+            features.append("[cyan]🚀 Speculative Decoding[/cyan]")
+        
+        if features:
+            console.print("[dim]Active Features:[/dim] " + " • ".join(features))
+            console.print()
+        
+        # Commands Panel
         console.print(Panel(
-            f"[green]Model loaded: {model_id}[/green]\n"
-            f"[dim]Speed mode: {llm.memory_manager.speed_mode.value if llm.memory_manager else speed}[/dim]{spec_info}\n\n"
-            "Type your message and press Enter.\n"
-            "Commands: /help, /memory, /efficiency, /speed, /auto, /upgrade, /exit\",
-            title="💬 Chat Mode",
-            border_style="green"
+            "[bold]Commands:[/bold]\n"
+            "  [green]/help[/green]        Show all commands\n"
+            "  [green]/memory[/green]      GPU memory usage\n"
+            "  [green]/efficiency[/green]  Check optimization status\n"
+            "  [green]/speed[/green]       Change speed mode (fast/balanced/memory)\n"
+            "  [green]/auto on[/green]     Auto-optimize based on GPU usage\n"
+            "  [green]/upgrade[/green]     Upgrade for better performance\n"
+            "  [green]/exit[/green]        Exit chat",
+            title="💬 Chat Ready",
+            border_style="green",
+            padding=(0, 2)
         ))
         
         # Check if upgrade is available and show hint
@@ -246,9 +322,11 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
                 console.print(f"\n[cyan]💡 Performance upgrade available![/cyan]")
                 console.print(f"   Current: {upgrade_info['current_quantization']} → Recommended: {upgrade_info['recommended_quantization'] or 'fp16'}")
                 console.print(f"   Expected speedup: {upgrade_info['estimated_speedup']}")
-                console.print("[dim]   Type /upgrade for details[/dim]\n")
+                console.print("[dim]   Type /upgrade for details[/dim]")
         except Exception:
             pass  # Silently ignore upgrade check errors
+        
+        console.print()  # Spacing before chat starts
         
         history = []
         tokens_generated = 0
