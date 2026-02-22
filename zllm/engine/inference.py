@@ -6,8 +6,8 @@ Our own transformer inference implementation - no external dependencies.
 Features:
 - Layer-wise loading for memory efficiency
 - Supports any GGUF model
-- Custom CUDA kernels (optional)
-- PyTorch-native operations
+- Custom CUDA/Triton kernels for acceleration
+- PyTorch-native fallback operations
 """
 
 import math
@@ -20,6 +20,21 @@ import torch.nn.functional as F
 
 from .gguf_parser import GGUFParser, GGUFMetadata, GGUFTensor
 from .quantization import dequantize_tensor
+
+# Try to import CUDA kernels
+try:
+    from .cuda_kernels import (
+        rms_norm_cuda,
+        apply_rope_cuda,
+        flash_attention_cuda,
+        is_triton_available,
+    )
+    CUDA_KERNELS_AVAILABLE = is_triton_available()
+except ImportError:
+    CUDA_KERNELS_AVAILABLE = False
+    rms_norm_cuda = None
+    apply_rope_cuda = None
+    flash_attention_cuda = None
 
 
 @dataclass
@@ -37,17 +52,24 @@ class InferenceConfig:
     # Memory options
     layer_offload: bool = False  # Offload layers to CPU when not in use
     kv_cache_quantize: bool = True  # Quantize KV cache
+    
+    # Performance options
+    use_cuda_kernels: bool = True  # Use custom CUDA/Triton kernels when available
+    use_flash_attention: bool = True  # Use Flash Attention
 
 
 class RMSNorm(nn.Module):
     """RMS Normalization (used by LLaMA, Qwen, etc.)."""
     
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, use_cuda: bool = True):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self.use_cuda = use_cuda and CUDA_KERNELS_AVAILABLE
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_cuda and x.is_cuda:
+            return rms_norm_cuda(x, self.weight, self.eps)
         norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return x * norm * self.weight
 
@@ -106,6 +128,8 @@ class TransformerLayer(nn.Module):
         num_kv_heads: int,
         intermediate_size: int,
         rms_norm_eps: float = 1e-6,
+        use_cuda_kernels: bool = True,
+        use_flash_attention: bool = True,
     ):
         super().__init__()
         
@@ -114,16 +138,18 @@ class TransformerLayer(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = hidden_size // num_heads
         self.intermediate_size = intermediate_size
+        self.use_cuda_kernels = use_cuda_kernels and CUDA_KERNELS_AVAILABLE
+        self.use_flash_attention = use_flash_attention and CUDA_KERNELS_AVAILABLE
         
         # Attention
-        self.input_layernorm = RMSNorm(hidden_size, rms_norm_eps)
+        self.input_layernorm = RMSNorm(hidden_size, rms_norm_eps, use_cuda=use_cuda_kernels)
         self.q_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=False)
         
         # FFN
-        self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps, use_cuda=use_cuda_kernels)
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
@@ -154,8 +180,13 @@ class TransformerLayer(nn.Module):
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
-        # Apply RoPE
-        q, k = apply_rope(q, k, cos, sin, position_ids)
+        # Apply RoPE (use CUDA kernel if available)
+        if self.use_cuda_kernels and q.is_cuda:
+            pos_cos = cos[position_ids]
+            pos_sin = sin[position_ids]
+            q, k = apply_rope_cuda(q, k, pos_cos, pos_sin)
+        else:
+            q, k = apply_rope(q, k, cos, sin, position_ids)
         
         # KV cache
         if kv_cache is not None:
@@ -171,15 +202,20 @@ class TransformerLayer(nn.Module):
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
         
-        # Attention
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-        
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        attn_output = torch.matmul(attn_weights, v)
+        # Attention - use Flash Attention if available
+        if self.use_flash_attention and q.is_cuda and attention_mask is None:
+            # Flash Attention (memory efficient)
+            attn_output = flash_attention_cuda(q, k, v, causal=True)
+        else:
+            # Standard attention
+            scale = 1.0 / math.sqrt(self.head_dim)
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+            
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_output = torch.matmul(attn_weights, v)
         
         # Reshape back
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)

@@ -6,7 +6,7 @@ No external dependencies - 100% controlled by us.
 Supports:
 - GGUF format parsing
 - Quantized inference (Q4_K_M, Q8_0, etc.)
-- Custom CUDA kernels
+- Custom CUDA/Triton kernels
 - Memory-efficient layer streaming
 """
 
@@ -21,6 +21,15 @@ from .quantization import (
 )
 from .inference import ZLLMInferenceEngine, InferenceConfig, load_engine
 from .tokenizer import SimpleTokenizer, ChatTemplate, load_tokenizer_from_gguf
+from .cuda_kernels import (
+    dequant_q8_0_cuda,
+    dequant_q4_0_cuda,
+    rms_norm_cuda,
+    apply_rope_cuda,
+    flash_attention_cuda,
+    is_triton_available,
+    get_backend_info,
+)
 
 __all__ = [
     # Parser
@@ -43,4 +52,12 @@ __all__ = [
     "SimpleTokenizer",
     "ChatTemplate",
     "load_tokenizer_from_gguf",
+    # CUDA Kernels
+    "dequant_q8_0_cuda",
+    "dequant_q4_0_cuda",
+    "rms_norm_cuda",
+    "apply_rope_cuda",
+    "flash_attention_cuda",
+    "is_triton_available",
+    "get_backend_info",
 ]
