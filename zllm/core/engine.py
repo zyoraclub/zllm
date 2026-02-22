@@ -178,7 +178,7 @@ class ZLLM:
         # Track load constraints
         self._load_constraints["original_quantization"] = user_requested_quant
         self._load_constraints["model_size_gb"] = self.model_info.size_gb
-        self._load_constraints["available_vram_gb"] = self.hardware_info.gpu_memory_total_gb if self.hardware_info.gpu_available else 0
+        self._load_constraints["available_vram_gb"] = self.hardware_info.total_gpu_memory_gb if self.hardware_info.has_gpu else 0
         
         if quant is None and self.config.auto_quantize:
             quant = self.hardware_info.get_recommended_quantization(
