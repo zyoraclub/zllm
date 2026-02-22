@@ -567,8 +567,8 @@ class ZLLM:
             stats["speed_mode"] = self.memory_manager.speed_mode.value
         
         if self.orchestrator:
-            stats["orchestrator_active"] = self.orchestrator.running
-            stats["memory_pressure"] = self.orchestrator.current_pressure.value if self.orchestrator.current_pressure else "unknown"
+            stats["orchestrator_active"] = self.orchestrator._running
+            stats["speed_mode_auto"] = self.orchestrator._current_speed_mode.value if hasattr(self.orchestrator, '_current_speed_mode') else "unknown"
         
         return stats
     
