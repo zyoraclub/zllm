@@ -227,7 +227,7 @@ class ZLLM:
         # Initialize KV Cache manager for efficient context handling
         from zllm.core.kv_cache import KVCacheManager, QuantizationScheme
         self.kv_cache_manager = KVCacheManager(
-            quantization_scheme=QuantizationScheme.INT8,  # 50% memory savings
+            quantization=QuantizationScheme.INT8,  # 50% memory savings
             enable_prompt_cache=True,
             enable_prefix_cache=True,
             prompt_cache_size=100,
