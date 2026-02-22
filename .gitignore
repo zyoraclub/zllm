@@ -45,7 +45,7 @@ htmlcov/
 *.bin
 *.pt
 *.ckpt
-models/
+/models/
 .cache/
 
 # OS
