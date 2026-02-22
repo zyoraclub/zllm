@@ -234,7 +234,7 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
             f"[green]Model loaded: {model_id}[/green]\n"
             f"[dim]Speed mode: {llm.memory_manager.speed_mode.value if llm.memory_manager else speed}[/dim]{spec_info}\n\n"
             "Type your message and press Enter.\n"
-            "Commands: /help, /memory, /stats, /clear, /speed, /upgrade, /speculative, exit",
+            "Commands: /help, /memory, /efficiency, /speed, /auto, /upgrade, exit\",
             title="💬 Chat Mode",
             border_style="green"
         ))
@@ -271,19 +271,23 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
 
   [green]/help[/green]        - Show this help message
   [green]/memory[/green]      - Show VRAM/memory usage
+  [green]/efficiency[/green]  - Check GPU efficiency & get recommendations
   [green]/stats[/green]       - Show cache and generation stats
   [green]/kv[/green]          - Show KV cache statistics  
   [green]/clear[/green]       - Clear conversation history
   [green]/speed[/green]       - Show/change speed mode (fast/balanced/memory)
+  [green]/auto[/green]        - Enable/disable auto speed adjustment
+  [green]/quiet[/green]       - Hide optimization suggestions
   [green]/upgrade[/green]     - Check/perform model upgrade for better speed
   [green]/speculative[/green] - Show speculative decoding stats
   [green]exit[/green]         - Exit chat
 
-[bold cyan]Upgrade Commands:[/bold cyan]
-  /upgrade         - Check if upgrade is available
-  /upgrade now     - Upgrade to recommended settings
-  /upgrade fp16    - Upgrade to full precision (fastest)
-  /upgrade int8    - Upgrade to INT8 quantization
+[bold cyan]Performance Commands:[/bold cyan]
+  /speed fast      - Maximize speed (uses more VRAM)
+  /speed memory    - Minimize memory (slower but fits larger contexts)
+  /auto on         - Auto-adjust speed based on GPU usage
+  /upgrade now     - Reload model without quantization (fastest)
+  /efficiency      - Show current GPU utilization & suggestions
 """
                     console.print(help_text)
                     continue
@@ -452,6 +456,56 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
                         console.print("[dim]Start with: zllm run model --speculative draft-model[/dim]")
                     continue
                 
+                if user_input.lower().startswith("/auto"):
+                    parts = user_input.split()
+                    if len(parts) == 1:
+                        # Show auto status
+                        auto_enabled = llm._runtime_monitor.get("auto_adjust", False) if hasattr(llm, '_runtime_monitor') else False
+                        console.print(f"\n[bold]Auto-adjust:[/bold] {'enabled' if auto_enabled else 'disabled'}")
+                        console.print("[dim]Usage: /auto on|off[/dim]")
+                        console.print("[dim]When enabled, engine automatically adjusts speed based on memory[/dim]")
+                    else:
+                        setting = parts[1].lower()
+                        if setting in ["on", "true", "yes", "1"]:
+                            llm.set_auto_adjust(True)
+                            console.print("[green]✓ Auto-adjust enabled[/green]")
+                            console.print("[dim]Engine will now automatically optimize speed based on GPU memory[/dim]")
+                            # Show current status
+                            mem_check = llm.check_runtime_memory()
+                            console.print(f"  Current GPU: {mem_check.get('usage_percent', 0):.0f}% ({mem_check.get('allocated_gb', 0):.1f}GB / {mem_check.get('total_gb', 0):.1f}GB)")
+                            console.print(f"  Speed mode: {mem_check.get('current_speed_mode', 'unknown')}")
+                        elif setting in ["off", "false", "no", "0"]:
+                            llm.set_auto_adjust(False)
+                            console.print("[yellow]✓ Auto-adjust disabled[/yellow]")
+                        else:
+                            console.print("[red]Invalid option. Use: /auto on or /auto off[/red]")
+                    continue
+                
+                if user_input.lower() == "/quiet":
+                    llm.silence_recommendations()
+                    console.print("[dim]✓ Optimization suggestions disabled for this session[/dim]")
+                    console.print("[dim]Use /auto on for automatic optimization[/dim]")
+                    continue
+                
+                if user_input.lower() == "/efficiency":
+                    mem_check = llm.check_runtime_memory()
+                    console.print("\n[bold cyan]GPU Efficiency Status:[/bold cyan]")
+                    console.print(f"  GPU Usage: {mem_check.get('usage_percent', 0):.0f}%")
+                    console.print(f"  Allocated: {mem_check.get('allocated_gb', 0):.1f}GB / {mem_check.get('total_gb', 0):.1f}GB")
+                    console.print(f"  Free: {mem_check.get('free_gb', 0):.1f}GB")
+                    console.print(f"  Speed Mode: {mem_check.get('current_speed_mode', 'unknown')}")
+                    console.print(f"  Status: {mem_check.get('status', 'unknown')}")
+                    
+                    if mem_check.get("recommendation"):
+                        console.print(f"\n[cyan]💡 {mem_check['recommendation']}[/cyan]")
+                        if mem_check.get("can_upgrade"):
+                            console.print("[dim]   Run /upgrade now to apply[/dim]")
+                        elif mem_check.get("can_speed_up"):
+                            console.print("[dim]   Run /speed fast or /auto on to apply[/dim]")
+                    else:
+                        console.print("\n[green]✓ Running at optimal efficiency[/green]")
+                    continue
+                
                 # Generate response
                 console.print("\n[bold green]Assistant[/bold green]:", end=" ")
                 
@@ -477,6 +531,22 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
                 # Show generation stats
                 if gen_time > 0:
                     console.print(f"[dim]{token_count} tokens in {gen_time:.1f}s ({token_count/gen_time:.1f} tok/s)[/dim]")
+                
+                # Check for runtime optimization recommendations
+                try:
+                    recommendation = llm.get_speed_recommendation()
+                    if recommendation and recommendation.get("recommendation"):
+                        console.print()
+                        if recommendation.get("action") == "upgrade":
+                            console.print(f"[cyan]💡 {recommendation['recommendation']}[/cyan]")
+                        elif recommendation.get("action") == "speed_up":
+                            console.print(f"[cyan]💡 {recommendation['recommendation']}[/cyan]")
+                            console.print("[dim]   Use /speed fast or /auto to optimize automatically[/dim]")
+                        elif recommendation.get("action") == "slow_down":
+                            console.print(f"[yellow]⚠️  {recommendation['recommendation']}[/yellow]")
+                        console.print("[dim]   Use /quiet to hide these suggestions[/dim]")
+                except Exception:
+                    pass  # Don't let monitoring errors interrupt chat
                 
                 # Update history
                 history.append({"role": "user", "content": user_input})

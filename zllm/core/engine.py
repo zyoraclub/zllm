@@ -89,6 +89,19 @@ class ZLLM:
             "available_vram_gb": 0,
         }
         
+        # Runtime memory monitoring configuration
+        self._runtime_monitor = {
+            "enabled": True,
+            "check_interval": 5,        # Check every N generations
+            "generation_count": 0,      # Counter for generations
+            "last_recommendation": None,  # Last recommendation given
+            "low_usage_threshold": 0.5,  # Alert if GPU usage below 50%
+            "high_usage_threshold": 0.85,  # Alert if GPU usage above 85%
+            "auto_adjust": False,        # Auto-adjust speed mode based on memory
+            "shown_recommendations": 0,   # Track how many times we've shown
+            "max_recommendations": 3,     # Don't spam - max recommendations per session
+        }
+        
         # Model components (loaded later)
         self.model = None
         self.tokenizer = None
@@ -721,6 +734,170 @@ class ZLLM:
             self.config.auto_quantize = original_auto_quantize
         
         return self
+    
+    def check_runtime_memory(self) -> Dict[str, Any]:
+        """
+        Check current GPU memory usage and provide recommendations.
+        
+        Called automatically after generations to provide smart suggestions.
+        
+        Returns:
+            Dict with:
+            - usage_percent: Current GPU usage percentage
+            - status: "optimal" | "underutilized" | "high_pressure"
+            - recommendation: Suggestion text (if any)
+            - action: Suggested action ("speed_up" | "slow_down" | None)
+            - can_speed_up: Whether speed can be increased
+        """
+        result = {
+            "usage_percent": 0,
+            "status": "optimal",
+            "recommendation": None,
+            "action": None,
+            "can_speed_up": False,
+            "can_upgrade": False,
+        }
+        
+        if not torch.cuda.is_available():
+            return result
+        
+        # Get memory usage
+        gpu_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        gpu_allocated = torch.cuda.memory_allocated() / 1024**3
+        gpu_usage = gpu_allocated / gpu_total if gpu_total > 0 else 0
+        
+        result["usage_percent"] = round(gpu_usage * 100, 1)
+        result["allocated_gb"] = round(gpu_allocated, 2)
+        result["total_gb"] = round(gpu_total, 2)
+        result["free_gb"] = round(gpu_total - gpu_allocated, 2)
+        
+        # Get current speed mode
+        current_mode = self.memory_manager.speed_mode.value if self.memory_manager else "balanced"
+        result["current_speed_mode"] = current_mode
+        
+        # Analyze and recommend
+        low_threshold = self._runtime_monitor["low_usage_threshold"]
+        high_threshold = self._runtime_monitor["high_usage_threshold"]
+        
+        if gpu_usage < low_threshold:
+            # Underutilized - can speed up
+            result["status"] = "underutilized"
+            result["can_speed_up"] = True
+            
+            if current_mode == "memory":
+                result["action"] = "speed_up"
+                result["recommendation"] = (
+                    f"GPU only {result['usage_percent']:.0f}% utilized ({result['free_gb']:.1f}GB free). "
+                    f"Switch to 'balanced' or 'fast' mode for better speed."
+                )
+            elif current_mode == "balanced":
+                result["action"] = "speed_up"
+                result["recommendation"] = (
+                    f"GPU {result['usage_percent']:.0f}% utilized with {result['free_gb']:.1f}GB free. "
+                    f"Switch to 'fast' mode for ~20% speed boost."
+                )
+            
+            # Check if upgrade (less quantization) is possible
+            upgrade_info = self.can_upgrade()
+            if upgrade_info.get("can_upgrade"):
+                result["can_upgrade"] = True
+                result["recommendation"] = (
+                    f"GPU only {result['usage_percent']:.0f}% utilized. "
+                    f"Use /upgrade for {upgrade_info.get('estimated_speedup', '1.5-2x')} faster inference!"
+                )
+                result["action"] = "upgrade"
+                
+        elif gpu_usage > high_threshold:
+            # High pressure - might want to reduce
+            result["status"] = "high_pressure"
+            
+            if current_mode == "fast":
+                result["action"] = "slow_down"
+                result["recommendation"] = (
+                    f"GPU at {result['usage_percent']:.0f}% capacity. "
+                    f"Switch to 'balanced' mode to prevent OOM on longer contexts."
+                )
+        else:
+            result["status"] = "optimal"
+        
+        return result
+    
+    def get_speed_recommendation(self) -> Optional[Dict[str, Any]]:
+        """
+        Get a speed recommendation if one is warranted.
+        
+        This is called after each generation to determine if user should
+        be notified about optimization opportunities.
+        
+        Returns:
+            Recommendation dict or None if no recommendation needed.
+        """
+        # Increment generation counter
+        self._runtime_monitor["generation_count"] += 1
+        
+        # Check if monitoring is enabled
+        if not self._runtime_monitor["enabled"]:
+            return None
+        
+        # Don't spam recommendations
+        if self._runtime_monitor["shown_recommendations"] >= self._runtime_monitor["max_recommendations"]:
+            return None
+        
+        # Only check at intervals
+        if self._runtime_monitor["generation_count"] % self._runtime_monitor["check_interval"] != 0:
+            return None
+        
+        # Get memory status
+        mem_check = self.check_runtime_memory()
+        
+        # Only recommend if there's an action
+        if not mem_check.get("action"):
+            return None
+        
+        # Don't repeat the same recommendation
+        if mem_check.get("recommendation") == self._runtime_monitor["last_recommendation"]:
+            return None
+        
+        # Update tracking
+        self._runtime_monitor["last_recommendation"] = mem_check.get("recommendation")
+        self._runtime_monitor["shown_recommendations"] += 1
+        
+        return mem_check
+    
+    def set_auto_adjust(self, enabled: bool) -> None:
+        """
+        Enable/disable automatic speed mode adjustment based on memory usage.
+        
+        When enabled, engine will automatically switch speed modes to optimize
+        for current memory conditions.
+        """
+        self._runtime_monitor["auto_adjust"] = enabled
+        
+        if enabled and self.memory_manager:
+            # Immediately check and adjust
+            mem_check = self.check_runtime_memory()
+            from zllm.core.memory import SpeedMode
+            
+            if mem_check["status"] == "underutilized" and mem_check.get("can_speed_up"):
+                current = self.memory_manager.speed_mode
+                if current == SpeedMode.MEMORY_SAVER:
+                    self.memory_manager.speed_mode = SpeedMode.BALANCED
+                elif current == SpeedMode.BALANCED:
+                    self.memory_manager.speed_mode = SpeedMode.FAST
+            elif mem_check["status"] == "high_pressure":
+                current = self.memory_manager.speed_mode
+                if current == SpeedMode.FAST:
+                    self.memory_manager.speed_mode = SpeedMode.BALANCED
+    
+    def silence_recommendations(self) -> None:
+        """Stop showing runtime recommendations for this session."""
+        self._runtime_monitor["enabled"] = False
+    
+    def reset_recommendations(self) -> None:
+        """Reset recommendation counter to show suggestions again."""
+        self._runtime_monitor["shown_recommendations"] = 0
+        self._runtime_monitor["last_recommendation"] = None
+        self._runtime_monitor["enabled"] = True
     
     def clear_cache(self) -> None:
         """Clear the response cache and KV cache."""
