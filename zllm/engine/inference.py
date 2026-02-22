@@ -12,8 +12,9 @@ Features:
 
 import math
 from typing import Optional, Dict, List, Tuple, Iterator, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,8 +51,14 @@ class InferenceConfig:
     dtype: torch.dtype = torch.float16
     
     # Memory options
-    layer_offload: bool = False  # Offload layers to CPU when not in use
+    layer_offload: bool = False  # Offload layers to CPU when not in use (legacy)
     kv_cache_quantize: bool = True  # Quantize KV cache
+    
+    # Layer Streaming - THE KEY TO RUNNING 7B ON 2-3GB VRAM
+    layer_streaming: bool = True  # Enable layer streaming (load layers on demand)
+    max_gpu_layers: Optional[int] = None  # Max layers on GPU (auto-calculated if None)
+    speed_mode: str = "balanced"  # "fast", "balanced", "memory" 
+    prefetch_layers: int = 2  # Number of layers to prefetch ahead
     
     # Performance options
     use_cuda_kernels: bool = True  # Use custom CUDA/Triton kernels when available
@@ -262,9 +269,19 @@ class TransformerLayer(nn.Module):
 
 class ZLLMInferenceEngine:
     """
-    ZLLM Native Inference Engine.
+    ZLLM Native Inference Engine with Layer Streaming.
     
     Our own implementation - no external dependencies.
+    
+    KEY INNOVATION: Layer Streaming
+    Instead of loading ALL layers to GPU (OOM on 7B models), we:
+    - Calculate optimal GPU layer budget based on available VRAM
+    - Keep only N layers on GPU at a time
+    - Stream remaining layers from CPU on demand
+    - Pin hot layers (12-20) on GPU for speed
+    - Prefetch next layers in background
+    
+    This enables running 7B models on 2-3GB VRAM!
     
     Example:
         engine = ZLLMInferenceEngine("model.gguf")
@@ -278,7 +295,7 @@ class ZLLMInferenceEngine:
         config: Optional[InferenceConfig] = None,
     ):
         """
-        Load a GGUF model for inference.
+        Load a GGUF model for inference with layer streaming.
         
         Args:
             model_path: Path to .gguf file
@@ -319,13 +336,22 @@ class ZLLMInferenceEngine:
         print(f"Heads: {self.num_heads}, KV Heads: {self.num_kv_heads}")
         print(f"Vocab: {self.vocab_size}, Context: {self.max_seq_len}")
         
-        # Load embeddings and output layers (always in memory)
+        # ============ LAYER STREAMING SETUP ============
+        self._setup_layer_streaming()
+        
+        # Load embeddings and output layers (always in GPU memory - small)
         self.embed_tokens = self._load_embedding()
         self.lm_head = self._load_lm_head()
         self.norm = self._load_final_norm()
         
-        # Layers (loaded on demand for memory efficiency)
-        self.layers: List[Optional[TransformerLayer]] = [None] * self.num_layers
+        # Layer storage
+        # GPU cache: layers currently on GPU (limited by budget)
+        # CPU cache: layers stored on CPU for streaming
+        self._gpu_layers: Dict[int, TransformerLayer] = {}
+        self._cpu_layers: Dict[int, TransformerLayer] = {}
+        
+        # Preload layers based on streaming mode
+        self._preload_layers()
         
         # Precompute RoPE cache
         rope_dim = self.metadata.rope_dimension_count or self.head_dim
@@ -339,6 +365,258 @@ class ZLLMInferenceEngine:
         # KV cache
         self.kv_cache: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * self.num_layers
     
+    def _setup_layer_streaming(self) -> None:
+        """
+        Setup layer streaming - THE KEY TO RUNNING 7B ON 2-3GB VRAM.
+        
+        Calculates optimal GPU layer budget based on:
+        1. Available VRAM
+        2. Layer size (from model architecture)
+        3. Speed mode (fast/balanced/memory)
+        4. KV cache reservation
+        """
+        # Estimate layer size in bytes
+        # Each layer has: Q, K, V, O projections + gate, up, down FFN + norms
+        attn_size = self.hidden_size * self.hidden_size * 4  # Q, K, V, O
+        ffn_size = self.hidden_size * self.intermediate_size * 3  # gate, up, down
+        norm_size = self.hidden_size * 2  # two RMSNorms
+        
+        # In fp16, each param is 2 bytes
+        bytes_per_param = 2 if self.dtype == torch.float16 else 4
+        self._layer_size_bytes = (attn_size + ffn_size + norm_size) * bytes_per_param
+        self._layer_size_mb = self._layer_size_bytes / (1024 * 1024)
+        
+        # Get available VRAM
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            free_vram, total_vram = torch.cuda.mem_get_info()
+            
+            # Reserve for KV cache (about 50% of max cache size)
+            kv_per_token = 2 * self.num_layers * self.num_kv_heads * self.head_dim * bytes_per_param
+            kv_reserve = kv_per_token * self.max_seq_len // 2
+            
+            # Reserve for embeddings and lm_head (roughly vocab_size * hidden_size * 2)
+            embed_reserve = self.vocab_size * self.hidden_size * bytes_per_param * 2
+            
+            # Available for layers
+            available = free_vram - kv_reserve - embed_reserve
+            
+            # Speed mode fractions
+            mode_fractions = {
+                "fast": 0.75,
+                "balanced": 0.60,
+                "memory": 0.40,
+            }
+            fraction = mode_fractions.get(self.config.speed_mode, 0.60)
+            budget = int(available * fraction)
+            
+            # Calculate max layers that fit
+            self._max_gpu_layers = max(1, budget // self._layer_size_bytes)
+            self._max_gpu_layers = min(self._max_gpu_layers, self.num_layers)
+        else:
+            # CPU mode - all layers on CPU
+            self._max_gpu_layers = 0
+        
+        # Override if user specified
+        if self.config.max_gpu_layers is not None:
+            self._max_gpu_layers = min(self.config.max_gpu_layers, self.num_layers)
+        
+        # Calculate hot layers (middle layers are most important)
+        # For 28 layers: hot = 10-18 (center)
+        hot_start = int(self.num_layers * 0.35)
+        hot_end = int(self.num_layers * 0.65)
+        self._hot_layers = set(range(hot_start, hot_end + 1))
+        
+        # Async prefetch executor
+        self._prefetch_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zllm_prefetch")
+        self._prefetch_futures: Dict[int, Any] = {}
+        
+        print(f"Layer Streaming: {self._max_gpu_layers}/{self.num_layers} layers on GPU")
+        print(f"Layer size: {self._layer_size_mb:.1f}MB, Hot layers: {hot_start}-{hot_end}")
+        print(f"Speed mode: {self.config.speed_mode}")
+    
+    def _preload_layers(self) -> None:
+        """
+        Preload layers based on streaming strategy.
+        
+        Strategy:
+        1. If layer_streaming disabled OR all layers fit: load all to GPU
+        2. Otherwise: load only hot layers to GPU, rest to CPU
+        """
+        if not self.config.layer_streaming or self._max_gpu_layers >= self.num_layers:
+            # Load all layers to GPU (legacy mode)
+            print("Loading all layers to GPU...")
+            for i in range(self.num_layers):
+                layer = self._create_and_load_layer(i)
+                layer = layer.to(self.device)
+                self._gpu_layers[i] = layer
+            print(f"Loaded {len(self._gpu_layers)} layers to GPU")
+        else:
+            # Layer streaming mode - load hot layers to GPU, rest to CPU
+            print(f"Layer streaming: loading {len(self._hot_layers)} hot layers to GPU...")
+            
+            # First, load all layers to CPU
+            for i in range(self.num_layers):
+                layer = self._create_and_load_layer(i)
+                self._cpu_layers[i] = layer.cpu()
+            
+            # Then move hot layers to GPU (up to budget)
+            loaded_to_gpu = 0
+            for i in sorted(self._hot_layers):
+                if loaded_to_gpu >= self._max_gpu_layers:
+                    break
+                layer = self._cpu_layers.pop(i)
+                self._gpu_layers[i] = layer.to(self.device)
+                loaded_to_gpu += 1
+            
+            print(f"GPU: {len(self._gpu_layers)} layers, CPU: {len(self._cpu_layers)} layers")
+    
+    def _get_layer(self, layer_idx: int) -> TransformerLayer:
+        """
+        Get a layer, loading to GPU if needed.
+        
+        This is where the streaming magic happens:
+        1. If layer on GPU: return it
+        2. If layer on CPU: move to GPU (evicting if needed)
+        3. Start prefetching next layer
+        """
+        # Already on GPU?
+        if layer_idx in self._gpu_layers:
+            return self._gpu_layers[layer_idx]
+        
+        # Need to load from CPU
+        if layer_idx not in self._cpu_layers:
+            raise RuntimeError(f"Layer {layer_idx} not found on CPU or GPU")
+        
+        # Check if we need to evict a layer
+        if len(self._gpu_layers) >= self._max_gpu_layers:
+            self._evict_layer()
+        
+        # Move layer to GPU
+        layer = self._cpu_layers.pop(layer_idx)
+        layer = layer.to(self.device)
+        self._gpu_layers[layer_idx] = layer
+        
+        # Start prefetching next layers
+        self._prefetch_layers_async(layer_idx)
+        
+        return layer
+    
+    def _evict_layer(self) -> None:
+        """
+        Evict the least important layer from GPU to CPU.
+        
+        Priority (evict first → evict last):
+        1. Low priority (layers 0-2 and last 3)
+        2. Normal priority (not in hot zone)
+        3. Hot layers (only evict if necessary)
+        """
+        # Find best candidate to evict
+        candidates = []
+        for idx in self._gpu_layers.keys():
+            if idx in self._hot_layers:
+                priority = 2  # Hot - evict last
+            elif idx < 3 or idx > self.num_layers - 3:
+                priority = 0  # Edge layers - evict first
+            else:
+                priority = 1  # Normal
+            candidates.append((idx, priority))
+        
+        # Sort by priority (ascending)
+        candidates.sort(key=lambda x: x[1])
+        
+        if candidates:
+            evict_idx = candidates[0][0]
+            layer = self._gpu_layers.pop(evict_idx)
+            self._cpu_layers[evict_idx] = layer.cpu()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    def _prefetch_layers_async(self, current_idx: int) -> None:
+        """Prefetch upcoming layers in background thread."""
+        if not self.config.layer_streaming:
+            return
+        
+        for offset in range(1, self.config.prefetch_layers + 1):
+            next_idx = current_idx + offset
+            if next_idx >= self.num_layers:
+                break
+            if next_idx in self._gpu_layers or next_idx in self._prefetch_futures:
+                continue
+            if next_idx not in self._cpu_layers:
+                continue
+            
+            # Submit prefetch task
+            future = self._prefetch_executor.submit(self._prefetch_layer, next_idx)
+            self._prefetch_futures[next_idx] = future
+    
+    def _prefetch_layer(self, layer_idx: int) -> None:
+        """Prefetch a single layer to GPU."""
+        try:
+            if layer_idx in self._gpu_layers:
+                return
+            if layer_idx not in self._cpu_layers:
+                return
+            
+            # Check if we need to evict
+            if len(self._gpu_layers) >= self._max_gpu_layers:
+                self._evict_layer()
+            
+            layer = self._cpu_layers.pop(layer_idx)
+            layer = layer.to(self.device)
+            self._gpu_layers[layer_idx] = layer
+        except Exception:
+            pass  # Ignore prefetch errors
+        finally:
+            self._prefetch_futures.pop(layer_idx, None)
+    
+    def _create_and_load_layer(self, layer_idx: int) -> TransformerLayer:
+        """Create a TransformerLayer and load weights from GGUF."""
+        layer = TransformerLayer(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            intermediate_size=self.intermediate_size,
+        )
+        
+        # Expected shapes for linear layers
+        q_shape = (self.num_heads * self.head_dim, self.hidden_size)
+        k_shape = (self.num_kv_heads * self.head_dim, self.hidden_size)
+        v_shape = (self.num_kv_heads * self.head_dim, self.hidden_size)
+        o_shape = (self.hidden_size, self.num_heads * self.head_dim)
+        gate_shape = (self.intermediate_size, self.hidden_size)
+        up_shape = (self.intermediate_size, self.hidden_size)
+        down_shape = (self.hidden_size, self.intermediate_size)
+        
+        # Load weights - try different naming conventions
+        prefix = f"model.layers.{layer_idx}"
+        
+        try:
+            # HuggingFace naming
+            layer.input_layernorm.weight.data = self._load_tensor(f"{prefix}.input_layernorm.weight")
+            layer.q_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.q_proj.weight", q_shape)
+            layer.k_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.k_proj.weight", k_shape)
+            layer.v_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.v_proj.weight", v_shape)
+            layer.o_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.o_proj.weight", o_shape)
+            layer.post_attention_layernorm.weight.data = self._load_tensor(f"{prefix}.post_attention_layernorm.weight")
+            layer.gate_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.gate_proj.weight", gate_shape)
+            layer.up_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.up_proj.weight", up_shape)
+            layer.down_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.down_proj.weight", down_shape)
+        except KeyError:
+            # Try llama.cpp naming (blk.N.*)
+            try:
+                layer.input_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_norm.weight")
+                layer.q_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_q.weight", q_shape)
+                layer.k_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_k.weight", k_shape)
+                layer.v_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_v.weight", v_shape)
+                layer.o_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_output.weight", o_shape)
+                layer.post_attention_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_norm.weight")
+                layer.gate_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_gate.weight", gate_shape)
+                layer.up_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_up.weight", up_shape)
+                layer.down_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_down.weight", down_shape)
+            except KeyError as e:
+                raise KeyError(f"Cannot load layer {layer_idx}: {e}")
+        
+        return layer.to(self.dtype)
+
     def _load_tensor(self, name: str) -> torch.Tensor:
         """Load a tensor from GGUF file."""
         if name not in self.parser.tensors:
@@ -430,68 +708,6 @@ class ZLLMInferenceEngine:
         
         raise KeyError("Final norm tensor not found")
     
-    def _load_layer(self, layer_idx: int) -> TransformerLayer:
-        """Load a transformer layer from GGUF."""
-        if self.layers[layer_idx] is not None:
-            return self.layers[layer_idx]
-        
-        layer = TransformerLayer(
-            hidden_size=self.hidden_size,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            intermediate_size=self.intermediate_size,
-        ).to(self.device).to(self.dtype)
-        
-        # Expected shapes for linear layers
-        q_shape = (self.num_heads * self.head_dim, self.hidden_size)
-        k_shape = (self.num_kv_heads * self.head_dim, self.hidden_size)
-        v_shape = (self.num_kv_heads * self.head_dim, self.hidden_size)
-        o_shape = (self.hidden_size, self.num_heads * self.head_dim)
-        gate_shape = (self.intermediate_size, self.hidden_size)
-        up_shape = (self.intermediate_size, self.hidden_size)
-        down_shape = (self.hidden_size, self.intermediate_size)
-        
-        # Load weights
-        prefix = f"model.layers.{layer_idx}"
-        
-        try:
-            # Attention norms and projections
-            layer.input_layernorm.weight.data = self._load_tensor(f"{prefix}.input_layernorm.weight")
-            layer.q_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.q_proj.weight", q_shape)
-            layer.k_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.k_proj.weight", k_shape)
-            layer.v_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.v_proj.weight", v_shape)
-            layer.o_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.o_proj.weight", o_shape)
-            
-            # FFN
-            layer.post_attention_layernorm.weight.data = self._load_tensor(f"{prefix}.post_attention_layernorm.weight")
-            layer.gate_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.gate_proj.weight", gate_shape)
-            layer.up_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.up_proj.weight", up_shape)
-            layer.down_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.down_proj.weight", down_shape)
-        except KeyError as e:
-            # Try alternative naming (e.g., for llama.cpp naming)
-            try:
-                layer.input_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_norm.weight")
-                layer.q_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_q.weight", q_shape)
-                layer.k_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_k.weight", k_shape)
-                layer.v_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_v.weight", v_shape)
-                layer.o_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_output.weight", o_shape)
-                layer.post_attention_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_norm.weight")
-                layer.gate_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_gate.weight", gate_shape)
-                layer.up_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_up.weight", up_shape)
-                layer.down_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_down.weight", down_shape)
-            except KeyError:
-                raise KeyError(f"Cannot load layer {layer_idx}: {e}")
-        
-        self.layers[layer_idx] = layer
-        return layer
-    
-    def _unload_layer(self, layer_idx: int) -> None:
-        """Unload a layer from GPU memory."""
-        if self.layers[layer_idx] is not None:
-            del self.layers[layer_idx]
-            self.layers[layer_idx] = None
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
     def clear_kv_cache(self) -> None:
         """Clear the KV cache."""
         self.kv_cache = [None] * self.num_layers
@@ -555,9 +771,10 @@ class ZLLMInferenceEngine:
         # Debug: check embedding stats
         print(f"Embedding: mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}")
         
-        # Layers
+        # Layers - with streaming support
         for layer_idx in range(self.num_layers):
-            layer = self._load_layer(layer_idx)
+            # Get layer (streaming: loads from CPU if needed)
+            layer = self._get_layer(layer_idx)
             
             kv_cache = self.kv_cache[layer_idx] if use_cache else None
             
@@ -580,10 +797,6 @@ class ZLLMInferenceEngine:
             
             if use_cache:
                 self.kv_cache[layer_idx] = new_kv_cache
-            
-            # Optionally offload layer after use
-            if self.config.layer_offload:
-                self._unload_layer(layer_idx)
         
         # Final norm and output
         hidden_states = self.norm(hidden_states)
@@ -733,9 +946,22 @@ class ZLLMInferenceEngine:
         self.parser.close()
         self.clear_kv_cache()
         
-        # Free layers
-        for i in range(self.num_layers):
-            self._unload_layer(i)
+        # Shutdown prefetch executor
+        if hasattr(self, '_prefetch_executor') and self._prefetch_executor:
+            self._prefetch_executor.shutdown(wait=False)
+        
+        # Free all layers (GPU and CPU)
+        for layer in self._gpu_layers.values():
+            del layer
+        self._gpu_layers.clear()
+        
+        for layer in self._cpu_layers.values():
+            del layer
+        self._cpu_layers.clear()
+        
+        # Clear GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def load_engine(
