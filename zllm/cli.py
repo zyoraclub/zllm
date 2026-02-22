@@ -234,7 +234,7 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
             f"[green]Model loaded: {model_id}[/green]\n"
             f"[dim]Speed mode: {llm.memory_manager.speed_mode.value if llm.memory_manager else speed}[/dim]{spec_info}\n\n"
             "Type your message and press Enter.\n"
-            "Commands: /help, /memory, /efficiency, /speed, /auto, /upgrade, exit\",
+            "Commands: /help, /memory, /efficiency, /speed, /auto, /upgrade, /exit\",
             title="💬 Chat Mode",
             border_style="green"
         ))
@@ -258,7 +258,7 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
             try:
                 user_input = Prompt.ask("\n[bold blue]You[/bold blue]")
                 
-                if user_input.lower() in ["exit", "quit", "q"]:
+                if user_input.lower() in ["exit", "quit", "q", "/exit", "/quit", "/q"]:
                     # Show session stats before exit
                     elapsed = time.time() - start_time
                     console.print(f"\n[dim]Session: {len(history)//2} exchanges, {tokens_generated} tokens, {elapsed:.0f}s[/dim]")
@@ -280,7 +280,7 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
   [green]/quiet[/green]       - Hide optimization suggestions
   [green]/upgrade[/green]     - Check/perform model upgrade for better speed
   [green]/speculative[/green] - Show speculative decoding stats
-  [green]exit[/green]         - Exit chat
+  [green]/exit[/green]        - Exit chat
 
 [bold cyan]Performance Commands:[/bold cyan]
   /speed fast      - Maximize speed (uses more VRAM)
