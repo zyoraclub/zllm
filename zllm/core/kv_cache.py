@@ -720,6 +720,14 @@ class KVCacheManager:
         
         return stats
     
+    def clear(self) -> None:
+        """Clear all caches."""
+        if self.prompt_cache:
+            self.prompt_cache.clear()
+        if self.prefix_cache:
+            self.prefix_cache._prefixes.clear()
+            self.prefix_cache._memory_used = 0
+    
     def print_stats(self) -> None:
         """Print all cache stats."""
         from rich.console import Console

@@ -951,13 +951,24 @@ def benchmark(model: str, prompts: int, max_tokens: int, speed: str):
         border_style="cyan"
     ))
     
-    config = ZLLMConfig(model_id=model_id, speed_mode=speed, max_new_tokens=max_tokens)
+    config = ZLLMConfig(
+        model_id=model_id, 
+        speed_mode=speed, 
+        max_new_tokens=max_tokens,
+        enable_cache=False,  # Disable caching for accurate benchmark
+        enable_semantic_cache=False,
+    )
     
     try:
         llm = ZLLM(model_id, config=config)
     except Exception as e:
         console.print(f"[red]Error loading model: {e}[/red]")
         return
+    
+    # Clear any pre-existing cache to ensure fresh generation
+    if llm._cache:
+        llm.clear_cache()
+    console.print("[dim]Cache disabled for accurate benchmarking[/dim]\n")
     
     results = []
     total_tokens = 0
