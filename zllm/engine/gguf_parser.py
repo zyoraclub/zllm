@@ -454,8 +454,15 @@ class GGUFParser:
         tensor_info = self.tensors[name]
         raw_data = self.load_tensor_raw(name)
         
-        # Dequantize
-        tensor = dequantize_tensor(raw_data, tensor_info.dtype, tensor_info.shape)
+        # GGUF stores shape as (ne[0], ne[1]) where ne[0] is innermost dimension.
+        # For 2D tensors, we need to swap to get row-major (rows, cols) layout.
+        # This gives us the correct PyTorch shape directly without needing transpose.
+        shape = tensor_info.shape
+        if len(shape) == 2:
+            shape = (shape[1], shape[0])
+        
+        # Dequantize with corrected shape
+        tensor = dequantize_tensor(raw_data, tensor_info.dtype, shape)
         
         return tensor.to(device)
     

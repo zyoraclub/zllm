@@ -98,22 +98,46 @@ def apply_rope(
     sin: torch.Tensor,
     position_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary position embeddings."""
-    # Get the relevant positions
+    """
+    Apply rotary position embeddings (RoPE) with INTERLEAVED layout.
+    
+    LLaMA/Qwen use interleaved pairs: [x0, x1, x2, x3, ...] -> [r0, i0, r1, i1, ...]
+    where (r, i) are rotated (real, imaginary) pairs.
+    
+    Args:
+        q: Query tensor [B, H, T, D]
+        k: Key tensor [B, H, T, D]
+        cos: Cosine cache [T, D//2]
+        sin: Sine cache [T, D//2]
+        position_ids: Position indices [B, T]
+    """
+    # Get positions: cos/sin are [max_seq, dim//2], index to [B, T, dim//2]
     cos = cos[position_ids]  # (batch, seq_len, dim//2)
     sin = sin[position_ids]
     
-    # Reshape for broadcasting
-    cos = cos.unsqueeze(1)  # (batch, 1, seq_len, dim//2)
+    # CRITICAL: Match dtype to avoid FP32/FP16 mixing in attention
+    cos = cos.to(q.dtype)
+    sin = sin.to(q.dtype)
+    
+    # Reshape for broadcasting: [B, 1, T, dim//2] broadcasts to [B, H, T, dim//2]
+    cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
     
-    # Split into even and odd
-    q1, q2 = q[..., ::2], q[..., 1::2]
+    # Split into even and odd (interleaved pairs)
+    q1, q2 = q[..., ::2], q[..., 1::2]  # real, imag parts
     k1, k2 = k[..., ::2], k[..., 1::2]
     
-    # Apply rotation
-    q_rotated = torch.cat([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1)
-    k_rotated = torch.cat([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1)
+    # Apply rotation with INTERLEAVED output (critical for correctness!)
+    # Wrong: torch.cat([real, imag]) gives sequential layout
+    # Right: interleave back to original positions
+    q_rotated = torch.empty_like(q)
+    k_rotated = torch.empty_like(k)
+    
+    q_rotated[..., ::2] = q1 * cos - q2 * sin   # rotated real -> even indices
+    q_rotated[..., 1::2] = q1 * sin + q2 * cos  # rotated imag -> odd indices
+    
+    k_rotated[..., ::2] = k1 * cos - k2 * sin
+    k_rotated[..., 1::2] = k1 * sin + k2 * cos
     
     return q_rotated, k_rotated
 
@@ -163,34 +187,35 @@ class TransformerLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward pass."""
+        """Forward pass with float32 accumulation for numerical precision."""
         batch_size, seq_len, _ = hidden_states.shape
+        
+        # Store original dtype for output, promote to float32 for computation
+        original_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
         
         # Attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         
-        # QKV projections
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        # QKV projections - weights stay fp16 but output is float32
+        q = F.linear(hidden_states, self.q_proj.weight.float(), None)
+        k = F.linear(hidden_states, self.k_proj.weight.float(), None)
+        v = F.linear(hidden_states, self.v_proj.weight.float(), None)
         
         # Reshape for multi-head attention
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
-        # Apply RoPE (use CUDA kernel if available)
-        if self.use_cuda_kernels and q.is_cuda:
-            pos_cos = cos[position_ids]
-            pos_sin = sin[position_ids]
-            q, k = apply_rope_cuda(q, k, pos_cos, pos_sin)
-        else:
-            q, k = apply_rope(q, k, cos, sin, position_ids)
+        # Apply RoPE in float32
+        q, k = apply_rope(q, k, cos.float(), sin.float(), position_ids)
         
-        # KV cache
+        # KV cache (store in float32 for precision)
         if kv_cache is not None:
             k_cache, v_cache = kv_cache
+            k_cache = k_cache.float()
+            v_cache = v_cache.float()
             k = torch.cat([k_cache, k], dim=2)
             v = torch.cat([v_cache, v], dim=2)
         
@@ -202,46 +227,35 @@ class TransformerLayer(nn.Module):
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
         
-        # Ensure all tensors have same dtype
-        dtype = q.dtype
-        k = k.to(dtype)
-        v = v.to(dtype)
+        # Standard attention in float32
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
         
-        # Attention - use Flash Attention if available
-        if self.use_flash_attention and q.is_cuda and attention_mask is None:
-            # Flash Attention (memory efficient)
-            attn_output = flash_attention_cuda(q, k, v, causal=True)
-        else:
-            # Standard attention
-            scale = 1.0 / math.sqrt(self.head_dim)
-            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-            
-            if attention_mask is not None:
-                attn_weights = attn_weights + attention_mask
-            
-            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
-            attn_output = torch.matmul(attn_weights, v)
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
         
-        # Reshape back - ensure correct dtype
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape back
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        attn_output = attn_output.to(self.o_proj.weight.dtype)
-        attn_output = self.o_proj(attn_output)
+        attn_output = F.linear(attn_output, self.o_proj.weight.float(), None)
         
         hidden_states = residual + attn_output
         
-        # FFN
+        # FFN in float32
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         
-        # Ensure dtype matches for FFN
-        hidden_states = hidden_states.to(self.gate_proj.weight.dtype)
-        
         # SwiGLU
-        gate = F.silu(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
+        gate = F.silu(F.linear(hidden_states, self.gate_proj.weight.float(), None))
+        up = F.linear(hidden_states, self.up_proj.weight.float(), None)
+        hidden_states = F.linear(gate * up, self.down_proj.weight.float(), None)
         
         hidden_states = residual + hidden_states
+        
+        # Convert back to original dtype for memory efficiency
+        hidden_states = hidden_states.to(original_dtype)
         
         return hidden_states, new_kv_cache
 
@@ -344,15 +358,16 @@ class ZLLMInferenceEngine:
         return self.parser.load_tensor(name, self.device).to(self.dtype)
     
     def _load_linear_weight(self, name: str, expected_shape: tuple) -> torch.Tensor:
-        """Load a Linear layer weight, handling GGUF transpose convention."""
+        """Load a Linear layer weight from GGUF.
+        
+        GGUF shape is already corrected in load_tensor() to PyTorch convention:
+        (out_features, in_features) - no transpose needed.
+        """
         weight = self._load_tensor(name)
         
-        # GGUF stores weights transposed compared to PyTorch convention
-        # PyTorch Linear: (out_features, in_features)
-        # GGUF: (in_features, out_features)
+        # Verify shape matches expected
         if weight.shape != expected_shape:
-            if weight.shape == (expected_shape[1], expected_shape[0]):
-                weight = weight.t().contiguous()
+            print(f"WARNING: {name} shape {weight.shape} != expected {expected_shape}")
         
         return weight
     
@@ -369,9 +384,7 @@ class ZLLMInferenceEngine:
         for name in names:
             if name in self.parser.tensors:
                 weight = self._load_tensor(name)
-                # GGUF stores embeddings as (hidden_size, vocab_size), need to transpose
-                if weight.shape[0] == self.hidden_size and weight.shape[1] == self.vocab_size:
-                    weight = weight.t()
+                # GGUF shape is already corrected to (vocab_size, hidden_size)
                 embed = nn.Embedding(self.vocab_size, self.hidden_size, device=self.device)
                 embed.weight.data = weight
                 return embed
@@ -389,9 +402,7 @@ class ZLLMInferenceEngine:
         for name in names:
             if name in self.parser.tensors:
                 weight = self._load_tensor(name)
-                # GGUF stores as (hidden_size, vocab_size), Linear expects (vocab_size, hidden_size)
-                if weight.shape[0] == self.hidden_size and weight.shape[1] == self.vocab_size:
-                    weight = weight.t()
+                # GGUF shape is already corrected to (vocab_size, hidden_size)
                 lm_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False, device=self.device)
                 lm_head.weight.data = weight
                 return lm_head
@@ -541,6 +552,9 @@ class ZLLMInferenceEngine:
         # Embedding
         hidden_states = self.embed_tokens(input_ids)
         
+        # Debug: check embedding stats
+        print(f"Embedding: mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}")
+        
         # Layers
         for layer_idx in range(self.num_layers):
             layer = self._load_layer(layer_idx)
@@ -556,6 +570,14 @@ class ZLLMInferenceEngine:
                 kv_cache=kv_cache,
             )
             
+            # Debug: check layer stats
+            nan_cnt = torch.isnan(hidden_states).sum().item()
+            inf_cnt = torch.isinf(hidden_states).sum().item()
+            if layer_idx == 0:
+                print(f"Layer 0: mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}")
+            if nan_cnt > 0 or inf_cnt > 0:
+                print(f"Layer {layer_idx}: {nan_cnt} nan, {inf_cnt} inf")
+            
             if use_cache:
                 self.kv_cache[layer_idx] = new_kv_cache
             
@@ -566,6 +588,9 @@ class ZLLMInferenceEngine:
         # Final norm and output
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
+        
+        # Debug: logits stats
+        print(f"Logits: mean={logits.float().mean():.6f}, std={logits.float().std():.6f}")
         
         return logits
     
@@ -579,10 +604,20 @@ class ZLLMInferenceEngine:
         """Sample next token from logits."""
         logits = logits[:, -1, :]  # Last position
         
+        # Handle inf/nan in logits
+        nan_count = torch.isnan(logits).sum().item()
+        inf_count = torch.isinf(logits).sum().item()
+        if nan_count > 0 or inf_count > 0:
+            print(f"WARNING: logits contain {nan_count} nan, {inf_count} inf out of {logits.numel()}")
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0)
+        
         if temperature == 0:
             return logits.argmax(dim=-1, keepdim=True)
         
         logits = logits / temperature
+        
+        # Clamp to prevent overflow in softmax
+        logits = torch.clamp(logits, min=-100.0, max=100.0)
         
         # Top-k filtering
         if top_k > 0:

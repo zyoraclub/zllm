@@ -409,18 +409,28 @@ def apply_rope_cuda(
     sin: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    GPU-accelerated RoPE application.
+    GPU-accelerated RoPE application with INTERLEAVED layout.
+    
+    The Triton kernel handles interleaving correctly.
+    The fallback must also use interleaved output.
     """
     if not TRITON_AVAILABLE or not q.is_cuda:
-        # Fallback to PyTorch implementation
+        # Fallback to PyTorch with INTERLEAVED layout
         q1, q2 = q[..., ::2], q[..., 1::2]
         k1, k2 = k[..., ::2], k[..., 1::2]
         
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
         
-        q_rotated = torch.cat([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1)
-        k_rotated = torch.cat([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1)
+        # Interleaved output (matching Triton kernel behavior)
+        q_rotated = torch.empty_like(q)
+        k_rotated = torch.empty_like(k)
+        
+        q_rotated[..., ::2] = q1 * cos - q2 * sin
+        q_rotated[..., 1::2] = q1 * sin + q2 * cos
+        
+        k_rotated[..., ::2] = k1 * cos - k2 * sin
+        k_rotated[..., 1::2] = k1 * sin + k2 * cos
         
         return q_rotated, k_rotated
     

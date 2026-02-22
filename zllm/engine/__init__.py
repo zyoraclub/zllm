@@ -1,16 +1,16 @@
 """
-ZLLM Native Engine - Our own inference engine.
-
-No external dependencies - 100% controlled by us.
+ZLLM Engine - Reliable LLM inference for GGUF models.
 
 Supports:
 - GGUF format parsing
-- Quantized inference (Q4_K_M, Q8_0, etc.)
-- Custom CUDA/Triton kernels
+- Quantized inference (Q4_K_M, Q5_K, Q6_K, Q8_0, etc.)
+- llama.cpp backend for production reliability
+- Custom CUDA/Triton kernels (optional)
 - Memory-efficient layer streaming
 """
 
 from .gguf_parser import GGUFParser, GGUFMetadata, GGUFTensor, inspect_gguf
+from .llama_cpp_backend import LlamaCppBackend, GenerationConfig, LLAMA_CPP_AVAILABLE
 from .quantization import (
     QuantType,
     dequantize_q4_0,

@@ -66,6 +66,8 @@ class SimpleTokenizer:
         """
         Encode text to token IDs.
         
+        Uses SentencePiece convention: add ▁ prefix for word boundaries.
+        
         Args:
             text: Input text
             add_bos: Add beginning of sequence token
@@ -79,13 +81,40 @@ class SimpleTokenizer:
         if add_bos:
             tokens.append(self.bos_token_id)
         
-        # Simple word-level + subword tokenization
-        # Split by whitespace and punctuation
-        words = self._split_text(text)
+        # SentencePiece convention: add space before text, then replace spaces with ▁
+        # This ensures "Hello" becomes "▁Hello" at the start
+        normalized_text = " " + text  # Add leading space
+        normalized_text = normalized_text.replace(" ", "▁")  # Replace spaces with ▁
         
-        for word in words:
-            word_tokens = self._tokenize_word(word)
-            tokens.extend(word_tokens)
+        # Greedy longest-match tokenization
+        pos = 0
+        while pos < len(normalized_text):
+            # Find longest matching token
+            best_len = 0
+            best_id = None
+            
+            for length in range(min(len(normalized_text) - pos, 50), 0, -1):
+                substr = normalized_text[pos:pos + length]
+                if substr in self.token_to_id:
+                    best_len = length
+                    best_id = self.token_to_id[substr]
+                    break
+            
+            if best_id is not None:
+                tokens.append(best_id)
+                pos += best_len
+            else:
+                # Single character fallback
+                char = normalized_text[pos]
+                if char in self.token_to_id:
+                    tokens.append(self.token_to_id[char])
+                else:
+                    # Unknown character - try hex encoding
+                    hex_token = f"<0x{ord(char):02X}>"
+                    if hex_token in self.token_to_id:
+                        tokens.append(self.token_to_id[hex_token])
+                    # else: skip unknown char
+                pos += 1
         
         if add_eos:
             tokens.append(self.eos_token_id)
