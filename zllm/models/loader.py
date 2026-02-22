@@ -217,9 +217,17 @@ class ModelLoader:
         }
         
         if quantization == "int8":
-            load_kwargs["load_in_8bit"] = True
+            try:
+                from transformers import BitsAndBytesConfig
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            except ImportError:
+                load_kwargs["load_in_8bit"] = True
         elif quantization == "int4":
-            load_kwargs["load_in_4bit"] = True
+            try:
+                from transformers import BitsAndBytesConfig
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+            except ImportError:
+                load_kwargs["load_in_4bit"] = True
         
         return AutoModelForCausalLM.from_pretrained(**load_kwargs)
     
