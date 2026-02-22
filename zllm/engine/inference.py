@@ -11,6 +11,7 @@ Features:
 """
 
 import math
+import threading
 from typing import Optional, Dict, List, Tuple, Iterator, Any
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -426,8 +427,11 @@ class ZLLMInferenceEngine:
         hot_end = int(self.num_layers * 0.65)
         self._hot_layers = set(range(hot_start, hot_end + 1))
         
-        # Async prefetch executor
-        self._prefetch_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zllm_prefetch")
+        # Thread safety lock for layer operations
+        self._layer_lock = threading.Lock()
+        
+        # Async prefetch executor (disabled for now - causes race conditions)
+        self._prefetch_executor = None  # ThreadPoolExecutor(max_workers=2, thread_name_prefix="zllm_prefetch")
         self._prefetch_futures: Dict[int, Any] = {}
         
         print(f"Layer Streaming: {self._max_gpu_layers}/{self.num_layers} layers on GPU")
@@ -481,33 +485,35 @@ class ZLLMInferenceEngine:
         This is where the streaming magic happens:
         1. If layer on GPU: return it
         2. If layer on CPU: move to GPU (evicting if needed)
-        3. Start prefetching next layer
         """
-        # Already on GPU?
-        if layer_idx in self._gpu_layers:
-            return self._gpu_layers[layer_idx]
-        
-        # Need to load from CPU
-        if layer_idx not in self._cpu_layers:
-            raise RuntimeError(f"Layer {layer_idx} not found on CPU or GPU")
-        
-        # Check if we need to evict a layer
-        if len(self._gpu_layers) >= self._max_gpu_layers:
-            self._evict_layer()
-        
-        # Move layer to GPU
-        layer = self._cpu_layers.pop(layer_idx)
-        layer = layer.to(self.device)
-        self._gpu_layers[layer_idx] = layer
-        
-        # Start prefetching next layers
-        self._prefetch_layers_async(layer_idx)
-        
-        return layer
+        with self._layer_lock:
+            # Already on GPU?
+            if layer_idx in self._gpu_layers:
+                return self._gpu_layers[layer_idx]
+            
+            # Need to load from CPU
+            if layer_idx not in self._cpu_layers:
+                # Debug: show what we have
+                print(f"ERROR: Layer {layer_idx} not found!")
+                print(f"  GPU layers: {sorted(self._gpu_layers.keys())}")
+                print(f"  CPU layers: {sorted(self._cpu_layers.keys())}")
+                raise RuntimeError(f"Layer {layer_idx} not found on CPU or GPU")
+            
+            # Check if we need to evict a layer
+            if len(self._gpu_layers) >= self._max_gpu_layers:
+                self._evict_layer_unsafe()
+            
+            # Move layer to GPU
+            layer = self._cpu_layers.pop(layer_idx)
+            layer = layer.to(self.device)
+            self._gpu_layers[layer_idx] = layer
+            
+            return layer
     
-    def _evict_layer(self) -> None:
+    def _evict_layer_unsafe(self) -> None:
         """
         Evict the least important layer from GPU to CPU.
+        NOTE: Must be called with _layer_lock held!
         
         Priority (evict first → evict last):
         1. Low priority (layers 0-2 and last 3)
@@ -535,8 +541,13 @@ class ZLLMInferenceEngine:
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     def _prefetch_layers_async(self, current_idx: int) -> None:
-        """Prefetch upcoming layers in background thread."""
-        if not self.config.layer_streaming:
+        """Prefetch upcoming layers in background thread.
+        
+        NOTE: Currently disabled to avoid race conditions.
+        """
+        return  # Disabled for thread safety
+        
+        if not self.config.layer_streaming or self._prefetch_executor is None:
             return
         
         for offset in range(1, self.config.prefetch_layers + 1):
@@ -553,24 +564,11 @@ class ZLLMInferenceEngine:
             self._prefetch_futures[next_idx] = future
     
     def _prefetch_layer(self, layer_idx: int) -> None:
-        """Prefetch a single layer to GPU."""
-        try:
-            if layer_idx in self._gpu_layers:
-                return
-            if layer_idx not in self._cpu_layers:
-                return
-            
-            # Check if we need to evict
-            if len(self._gpu_layers) >= self._max_gpu_layers:
-                self._evict_layer()
-            
-            layer = self._cpu_layers.pop(layer_idx)
-            layer = layer.to(self.device)
-            self._gpu_layers[layer_idx] = layer
-        except Exception:
-            pass  # Ignore prefetch errors
-        finally:
-            self._prefetch_futures.pop(layer_idx, None)
+        """Prefetch a single layer to GPU.
+        
+        NOTE: Currently disabled.
+        """
+        return  # Disabled for thread safety
     
     def _create_and_load_layer(self, layer_idx: int, device: str = "cpu") -> TransformerLayer:
         """Create a TransformerLayer and load weights from GGUF.
