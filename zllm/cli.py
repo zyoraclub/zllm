@@ -234,10 +234,21 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
             f"[green]Model loaded: {model_id}[/green]\n"
             f"[dim]Speed mode: {llm.memory_manager.speed_mode.value if llm.memory_manager else speed}[/dim]{spec_info}\n\n"
             "Type your message and press Enter.\n"
-            "Commands: /help, /memory, /stats, /clear, /speed, /speculative, exit",
+            "Commands: /help, /memory, /stats, /clear, /speed, /upgrade, /speculative, exit",
             title="💬 Chat Mode",
             border_style="green"
         ))
+        
+        # Check if upgrade is available and show hint
+        try:
+            upgrade_info = llm.can_upgrade()
+            if upgrade_info.get("can_upgrade"):
+                console.print(f"\n[cyan]💡 Performance upgrade available![/cyan]")
+                console.print(f"   Current: {upgrade_info['current_quantization']} → Recommended: {upgrade_info['recommended_quantization'] or 'fp16'}")
+                console.print(f"   Expected speedup: {upgrade_info['estimated_speedup']}")
+                console.print("[dim]   Type /upgrade for details[/dim]\n")
+        except Exception:
+            pass  # Silently ignore upgrade check errors
         
         history = []
         tokens_generated = 0
@@ -258,14 +269,21 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
                     help_text = """
 [bold cyan]Available Commands:[/bold cyan]
 
-  [green]/help[/green]       - Show this help message
-  [green]/memory[/green]     - Show VRAM/memory usage
-  [green]/stats[/green]      - Show cache and generation stats
-  [green]/kv[/green]         - Show KV cache statistics  
-  [green]/clear[/green]      - Clear conversation history
-  [green]/speed[/green]      - Show/change speed mode
+  [green]/help[/green]        - Show this help message
+  [green]/memory[/green]      - Show VRAM/memory usage
+  [green]/stats[/green]       - Show cache and generation stats
+  [green]/kv[/green]          - Show KV cache statistics  
+  [green]/clear[/green]       - Clear conversation history
+  [green]/speed[/green]       - Show/change speed mode (fast/balanced/memory)
+  [green]/upgrade[/green]     - Check/perform model upgrade for better speed
   [green]/speculative[/green] - Show speculative decoding stats
-  [green]exit[/green]        - Exit chat
+  [green]exit[/green]         - Exit chat
+
+[bold cyan]Upgrade Commands:[/bold cyan]
+  /upgrade         - Check if upgrade is available
+  /upgrade now     - Upgrade to recommended settings
+  /upgrade fp16    - Upgrade to full precision (fastest)
+  /upgrade int8    - Upgrade to INT8 quantization
 """
                     console.print(help_text)
                     continue
@@ -339,6 +357,14 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
                         current = llm.memory_manager.speed_mode.value if llm.memory_manager else "unknown"
                         console.print(f"\n[bold]Current speed mode:[/bold] {current}")
                         console.print("[dim]Usage: /speed <fast|balanced|memory>[/dim]")
+                        
+                        # Check if upgrade is available
+                        upgrade_info = llm.can_upgrade()
+                        if upgrade_info.get("can_upgrade"):
+                            console.print(f"\n[green]💡 Performance upgrade available![/green]")
+                            console.print(f"   {upgrade_info['reason']}")
+                            console.print(f"   Expected speedup: {upgrade_info['estimated_speedup']}")
+                            console.print("[dim]   Use /upgrade to reload with better performance[/dim]")
                     else:
                         new_mode = parts[1].lower()
                         if new_mode in ["fast", "balanced", "memory"]:
@@ -346,8 +372,67 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
                                 from zllm.core.memory import SpeedMode
                                 llm.memory_manager.speed_mode = SpeedMode(new_mode)
                                 console.print(f"[green]✓ Speed mode changed to: {new_mode}[/green]")
+                                
+                                # Show upgrade hint if available
+                                upgrade_info = llm.can_upgrade()
+                                if upgrade_info.get("can_upgrade") and new_mode == "fast":
+                                    console.print(f"\n[cyan]💡 Tip: Model was loaded with {upgrade_info['current_quantization']} quantization.[/cyan]")
+                                    console.print(f"   For best 'fast' mode performance, use [bold]/upgrade[/bold] to reload without quantization.")
+                                    console.print(f"   Expected speedup: {upgrade_info['estimated_speedup']}")
                         else:
                             console.print("[red]Invalid mode. Use: fast, balanced, or memory[/red]")
+                    continue
+                
+                if user_input.lower().startswith("/upgrade"):
+                    upgrade_info = llm.can_upgrade()
+                    parts = user_input.split()
+                    
+                    if len(parts) == 1:
+                        # Show upgrade status
+                        console.print("\n[bold cyan]Model Upgrade Status:[/bold cyan]")
+                        console.print(f"  Current quantization: {upgrade_info['current_quantization'] or 'fp16 (none)'}")
+                        console.print(f"  Memory available: {upgrade_info['memory_available_gb']:.1f}GB")
+                        
+                        if upgrade_info["can_upgrade"]:
+                            target = upgrade_info['recommended_quantization'] or 'fp16'
+                            console.print(f"\n[green]✓ Upgrade available![/green]")
+                            console.print(f"  Target: {target}")
+                            console.print(f"  Additional VRAM needed: {upgrade_info['memory_required_gb']:.1f}GB")
+                            console.print(f"  Expected speedup: {upgrade_info['estimated_speedup']}")
+                            console.print("\n[dim]Use '/upgrade now' to reload with better performance[/dim]")
+                            console.print("[dim]Use '/upgrade fp16' or '/upgrade int8' for specific target[/dim]")
+                        else:
+                            console.print(f"\n[yellow]ℹ️  {upgrade_info['reason']}[/yellow]")
+                    
+                    elif parts[1].lower() == "now":
+                        if not upgrade_info["can_upgrade"]:
+                            console.print(f"[yellow]Cannot upgrade: {upgrade_info['reason']}[/yellow]")
+                        else:
+                            console.print("\n[bold]⚠️  This will reload the model. Continue? (y/n)[/bold]")
+                            confirm = console.input().strip().lower()
+                            if confirm in ["y", "yes"]:
+                                try:
+                                    llm.upgrade_model()
+                                except Exception as e:
+                                    console.print(f"[red]Upgrade failed: {e}[/red]")
+                            else:
+                                console.print("[dim]Upgrade cancelled[/dim]")
+                    
+                    elif parts[1].lower() in ["fp16", "int8", "int4", "none"]:
+                        target = parts[1].lower()
+                        if target in ["fp16", "none"]:
+                            target = None
+                        console.print(f"\n[bold]⚠️  This will reload the model with {target or 'fp16'}. Continue? (y/n)[/bold]")
+                        confirm = console.input().strip().lower()
+                        if confirm in ["y", "yes"]:
+                            try:
+                                llm.upgrade_model(target_quantization=target)
+                            except Exception as e:
+                                console.print(f"[red]Upgrade failed: {e}[/red]")
+                        else:
+                            console.print("[dim]Upgrade cancelled[/dim]")
+                    else:
+                        console.print("[dim]Usage: /upgrade [now|fp16|int8|int4][/dim]")
                     continue
                 
                 if user_input.lower() == "/speculative":

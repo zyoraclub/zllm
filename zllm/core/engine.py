@@ -80,6 +80,15 @@ class ZLLM:
         # Flash Attention configuration
         self.flash_attention_config = None
         
+        # Track model loading constraints for upgrade capability
+        self._load_constraints = {
+            "quantization_forced": False,  # True if INT8/INT4 was auto-applied due to memory
+            "original_quantization": None,  # User's requested quantization
+            "applied_quantization": None,   # What was actually applied
+            "model_size_gb": 0,
+            "available_vram_gb": 0,
+        }
+        
         # Model components (loaded later)
         self.model = None
         self.tokenizer = None
@@ -150,13 +159,23 @@ class ZLLM:
             progress.update(task, description="Model info loaded")
         
         # Determine quantization
-        quant = quantization or self.config.quantization
+        user_requested_quant = quantization or self.config.quantization
+        quant = user_requested_quant
+        
+        # Track load constraints
+        self._load_constraints["original_quantization"] = user_requested_quant
+        self._load_constraints["model_size_gb"] = self.model_info.size_gb
+        self._load_constraints["available_vram_gb"] = self.hardware_info.gpu_memory_total_gb if self.hardware_info.gpu_available else 0
+        
         if quant is None and self.config.auto_quantize:
             quant = self.hardware_info.get_recommended_quantization(
                 self.model_info.size_gb
             )
             if quant:
                 console.print(f"[yellow]Auto-selected {quant} quantization for memory efficiency[/yellow]")
+                self._load_constraints["quantization_forced"] = True
+        
+        self._load_constraints["applied_quantization"] = quant
         
         # Load tokenizer
         with Progress(
@@ -539,6 +558,169 @@ class ZLLM:
             stats["memory_pressure"] = self.orchestrator.current_pressure.value if self.orchestrator.current_pressure else "unknown"
         
         return stats
+    
+    def can_upgrade(self) -> Dict[str, Any]:
+        """
+        Check if the model can be upgraded to a less quantized/faster version.
+        
+        Returns:
+            Dict with upgrade possibility info:
+            - can_upgrade: bool
+            - reason: str explaining why/why not
+            - current_quantization: current quantization level
+            - recommended_quantization: what we could upgrade to
+            - estimated_speedup: expected speed improvement
+            - memory_required_gb: how much VRAM needed for upgrade
+            - memory_available_gb: how much VRAM is currently free
+        """
+        result = {
+            "can_upgrade": False,
+            "reason": "",
+            "current_quantization": self._load_constraints.get("applied_quantization"),
+            "recommended_quantization": None,
+            "estimated_speedup": "1.0x",
+            "memory_required_gb": 0,
+            "memory_available_gb": 0,
+        }
+        
+        # Check if model was loaded with forced quantization
+        if not self._load_constraints.get("quantization_forced"):
+            result["reason"] = "Model was loaded with user-specified settings (no forced quantization)"
+            return result
+        
+        if not torch.cuda.is_available():
+            result["reason"] = "No GPU available for upgrade check"
+            return result
+        
+        # Get current memory state
+        gpu_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        gpu_allocated = torch.cuda.memory_allocated() / 1024**3
+        gpu_free = gpu_total - gpu_allocated
+        
+        result["memory_available_gb"] = round(gpu_free, 2)
+        
+        model_size = self._load_constraints.get("model_size_gb", 0)
+        current_quant = self._load_constraints.get("applied_quantization")
+        
+        # Calculate memory needed for different quantization levels
+        # FP16 baseline, INT8 ~0.5x size, INT4 ~0.25x size
+        if current_quant == "int8":
+            # Currently INT8, check if FP16 fits
+            fp16_size = model_size * 2  # INT8 is roughly half of FP16
+            additional_needed = fp16_size - model_size  # Extra memory needed
+            
+            result["memory_required_gb"] = round(additional_needed, 2)
+            
+            if gpu_free > additional_needed * 1.2:  # 20% safety margin
+                result["can_upgrade"] = True
+                result["recommended_quantization"] = None  # FP16 (no quantization)
+                result["estimated_speedup"] = "1.8-2.5x"
+                result["reason"] = f"Sufficient VRAM available ({gpu_free:.1f}GB free, need {additional_needed:.1f}GB more for FP16)"
+            else:
+                result["reason"] = f"Not enough VRAM for FP16 ({gpu_free:.1f}GB free, need {additional_needed:.1f}GB more)"
+                
+        elif current_quant == "int4":
+            # Currently INT4, check if INT8 or FP16 fits
+            int8_size = model_size * 2  # INT4 is roughly half of INT8
+            fp16_size = model_size * 4  # INT4 is roughly 1/4 of FP16
+            
+            int8_additional = int8_size - model_size
+            fp16_additional = fp16_size - model_size
+            
+            if gpu_free > fp16_additional * 1.2:
+                result["can_upgrade"] = True
+                result["recommended_quantization"] = None  # FP16
+                result["memory_required_gb"] = round(fp16_additional, 2)
+                result["estimated_speedup"] = "2.5-3.5x"
+                result["reason"] = f"Can upgrade to FP16 ({gpu_free:.1f}GB free)"
+            elif gpu_free > int8_additional * 1.2:
+                result["can_upgrade"] = True
+                result["recommended_quantization"] = "int8"
+                result["memory_required_gb"] = round(int8_additional, 2)
+                result["estimated_speedup"] = "1.3-1.8x"
+                result["reason"] = f"Can upgrade to INT8 ({gpu_free:.1f}GB free)"
+            else:
+                result["memory_required_gb"] = round(int8_additional, 2)
+                result["reason"] = f"Not enough VRAM for upgrade ({gpu_free:.1f}GB free, need {int8_additional:.1f}GB for INT8)"
+        else:
+            result["reason"] = "Model already at full precision (FP16)"
+        
+        return result
+    
+    def upgrade_model(self, target_quantization: Optional[str] = None) -> "ZLLM":
+        """
+        Reload the model with better quantization (less compression = faster).
+        
+        Args:
+            target_quantization: Target quantization level (None for FP16, "int8", "int4")
+                                If None, uses the recommended from can_upgrade()
+        
+        Returns:
+            self for chaining
+            
+        Raises:
+            RuntimeError: If upgrade not possible or would cause OOM
+        """
+        from rich.console import Console
+        console = Console()
+        
+        # Check if upgrade is possible
+        upgrade_info = self.can_upgrade()
+        
+        if not upgrade_info["can_upgrade"] and target_quantization is None:
+            console.print(f"[yellow]Cannot upgrade: {upgrade_info['reason']}[/yellow]")
+            return self
+        
+        # Determine target
+        if target_quantization is None:
+            target_quantization = upgrade_info["recommended_quantization"]
+        
+        model_id = self.config.model_id
+        if not model_id:
+            raise RuntimeError("No model ID available for reload")
+        
+        console.print(f"\n[cyan]🔄 Upgrading model...[/cyan]")
+        current = self._load_constraints.get("applied_quantization") or "fp16"
+        target_display = target_quantization or "fp16"
+        console.print(f"  Current: {current} → Target: {target_display}")
+        console.print(f"  Expected speedup: {upgrade_info.get('estimated_speedup', 'unknown')}")
+        
+        # Unload current model to free memory
+        console.print("  [dim]Unloading current model...[/dim]")
+        self.unload()
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Reload with new quantization
+        # Disable auto-quantize since we're explicitly setting it
+        original_auto_quantize = self.config.auto_quantize
+        self.config.auto_quantize = False
+        self.config.quantization = target_quantization
+        
+        try:
+            self.load_model(model_id, quantization=target_quantization)
+            console.print(f"[green]✓ Model upgraded successfully![/green]")
+            
+            # Update constraints to reflect manual upgrade
+            self._load_constraints["quantization_forced"] = False
+            self._load_constraints["applied_quantization"] = target_quantization
+            
+        except Exception as e:
+            console.print(f"[red]Upgrade failed: {e}[/red]")
+            console.print("[yellow]Attempting to restore previous configuration...[/yellow]")
+            self.config.auto_quantize = original_auto_quantize
+            self.config.quantization = self._load_constraints.get("original_quantization")
+            self.load_model(model_id)
+            raise RuntimeError(f"Upgrade failed: {e}")
+        finally:
+            self.config.auto_quantize = original_auto_quantize
+        
+        return self
     
     def clear_cache(self) -> None:
         """Clear the response cache and KV cache."""
