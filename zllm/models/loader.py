@@ -37,9 +37,11 @@ except ImportError:
 # GGUF/llama.cpp support
 try:
     from llama_cpp import Llama
-    GGUF_AVAILABLE = True
+    from zllm.backends.gguf import GGUFModel, load_gguf, GGUF_AVAILABLE
 except ImportError:
     GGUF_AVAILABLE = False
+    GGUFModel = None
+    load_gguf = None
 
 from huggingface_hub import hf_hub_download, snapshot_download, HfApi
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
@@ -402,40 +404,28 @@ class ModelLoader:
         Typically 3-4x faster than bitsandbytes.
         
         Args:
-            model_path: Path to .gguf file (local or HuggingFace)
+            model_path: Path to .gguf file OR HuggingFace repo
+                        (e.g., "Qwen/Qwen2-7B-Instruct-GGUF")
             n_ctx: Context window size
             n_gpu_layers: Number of layers to offload to GPU (-1 = all)
             verbose: Enable verbose output
         
         Returns:
-            Llama model ready for inference
+            GGUFModel ready for inference
         """
         if not GGUF_AVAILABLE:
             raise ImportError(
-                "llama-cpp-python is required for GGUF models. "
-                "Install with: pip install llama-cpp-python"
+                "llama-cpp-python is required for GGUF models.\n"
+                "Install with: pip install llama-cpp-python\n"
+                "For GPU: CMAKE_ARGS=\"-DGGML_CUDA=on\" pip install llama-cpp-python"
             )
         
-        # If it's a HuggingFace repo, download the GGUF file
-        if not Path(model_path).exists() and '/' in model_path:
-            # Try to find GGUF file in HuggingFace repo
-            try:
-                # This handles repos like "TheBloke/Llama-2-7B-Chat-GGUF"
-                model_path = hf_hub_download(
-                    repo_id=model_path.rsplit('/', 1)[0] if '.gguf' not in model_path else model_path.rsplit('/', 2)[0],
-                    filename=model_path.rsplit('/', 1)[-1] if '.gguf' in model_path else None,
-                    cache_dir=self.cache_dir,
-                )
-            except Exception:
-                pass  # If download fails, try using the path directly
-        
-        model = Llama(
-            model_path=str(model_path),
+        return load_gguf(
+            model_path,
             n_ctx=n_ctx,
             n_gpu_layers=n_gpu_layers,
-            verbose=verbose,
+            cache_dir=self.cache_dir,
         )
-        return model
     
     def iter_layers_safetensors(
         self,

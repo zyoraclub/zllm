@@ -107,6 +107,7 @@ class ZLLM:
         self.tokenizer = None
         self.generator: Optional[TextGenerator] = None
         self.model_info: Optional[ModelInfo] = None
+        self.is_gguf = False  # GGUF models have built-in tokenizer/generation
         
         # Cache
         self._cache: Optional[Union[SemanticCache, MemoryCache]] = None
@@ -168,6 +169,17 @@ class ZLLM:
             console=console,
         ) as progress:
             task = progress.add_task("Getting model info...", total=None)
+            
+            # Check if this is a GGUF model
+            backend = getattr(self.config, 'backend', 'bitsandbytes')
+            is_gguf_path = model_id.endswith('.gguf') or (
+                '/' in model_id and 'gguf' in model_id.lower()
+            )
+            if backend == 'gguf' or is_gguf_path:
+                self.is_gguf = True
+                self._load_gguf_model(model_id, console, progress, task)
+                return self
+            
             self.model_info = self.loader.get_model_info(model_id)
             progress.update(task, description="Model info loaded")
         
@@ -291,6 +303,52 @@ class ZLLM:
         
         return self
     
+    def _load_gguf_model(
+        self, 
+        model_id: str, 
+        console,
+        progress,
+        task,
+    ) -> None:
+        """
+        Load a GGUF model using llama-cpp-python.
+        
+        GGUF models have built-in tokenization and generation,
+        so we don't need transformers pipeline.
+        """
+        from zllm.backends.gguf import load_gguf, GGUFModel
+        
+        progress.update(task, description=f"Loading GGUF: {model_id}...")
+        
+        # Determine GPU layers
+        n_gpu_layers = -1  # All layers on GPU by default
+        if not self.hardware_info.has_gpu:
+            n_gpu_layers = 0  # CPU only
+        
+        # Load the GGUF model
+        self.model = load_gguf(
+            model_id,
+            n_ctx=4096,
+            n_gpu_layers=n_gpu_layers,
+            cache_dir=self.config.cache_dir,
+        )
+        
+        progress.update(task, description="GGUF model loaded")
+        
+        # GGUF models don't need separate tokenizer or generator
+        self.tokenizer = None
+        self.generator = None
+        
+        console.print()
+        console.print(f"[bold green]✓ GGUF model loaded![/bold green]")
+        console.print(f"  [cyan]Model: {self.model.info.filename}[/cyan]")
+        console.print(f"  [cyan]Quantization: {self.model.info.quantization}[/cyan]")
+        console.print(f"  [cyan]Size: {self.model.info.size_gb:.1f}GB[/cyan]")
+        if n_gpu_layers == -1:
+            console.print(f"  [cyan]GPU: All layers offloaded[/cyan]")
+        elif n_gpu_layers == 0:
+            console.print(f"  [yellow]GPU: CPU-only mode[/yellow]")
+    
     def _setup_flash_attention(self) -> None:
         """Configure Flash Attention for optimal performance."""
         from zllm.core.flash_attention import (
@@ -402,6 +460,10 @@ class ZLLM:
         Returns:
             Assistant response text
         """
+        # GGUF models have their own chat interface
+        if self.is_gguf:
+            return self._chat_gguf(message, system_prompt, history, **kwargs)
+        
         if self.generator is None:
             raise RuntimeError("No model loaded. Call load_model() first.")
         
@@ -465,6 +527,11 @@ class ZLLM:
         Yields:
             Response tokens as they're generated
         """
+        # GGUF models have their own streaming interface
+        if self.is_gguf:
+            yield from self._chat_stream_gguf(message, system_prompt, history, **kwargs)
+            return
+        
         if self.generator is None:
             raise RuntimeError("No model loaded. Call load_model() first.")
         
@@ -528,6 +595,70 @@ class ZLLM:
         )
         
         return self.generator.generate(prompt, gen_config)
+    
+    # === GGUF-specific methods ===
+    
+    def _chat_gguf(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        **kwargs,
+    ) -> str:
+        """Chat using GGUF model's native interface."""
+        if self.model is None:
+            raise RuntimeError("No model loaded. Call load_model() first.")
+        
+        # Build messages list
+        messages = []
+        
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        
+        if history:
+            messages.extend(history)
+        
+        messages.append({"role": "user", "content": message})
+        
+        # Generate using GGUF model
+        response = self.model.chat(
+            messages=messages,
+            max_tokens=kwargs.get("max_new_tokens", kwargs.get("max_tokens", self.config.max_new_tokens)),
+            temperature=kwargs.get("temperature", self.config.temperature),
+            stream=False,
+        )
+        
+        return response
+    
+    def _chat_stream_gguf(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        **kwargs,
+    ) -> Iterator[str]:
+        """Stream chat using GGUF model's native interface."""
+        if self.model is None:
+            raise RuntimeError("No model loaded. Call load_model() first.")
+        
+        # Build messages list
+        messages = []
+        
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        
+        if history:
+            messages.extend(history)
+        
+        messages.append({"role": "user", "content": message})
+        
+        # Stream using GGUF model
+        for token in self.model.chat_stream(
+            messages=messages,
+            max_tokens=kwargs.get("max_new_tokens", kwargs.get("max_tokens", self.config.max_new_tokens)),
+            temperature=kwargs.get("temperature", self.config.temperature),
+        ):
+            yield token
     
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache statistics including KV cache."""
