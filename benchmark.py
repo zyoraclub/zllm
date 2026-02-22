@@ -128,8 +128,8 @@ def benchmark_inference(
             end_time = time.perf_counter()
             gen_time = end_time - start_time
             
-            # Count tokens (approximate)
-            tokens = len(response.split()) * 1.3  # Rough approximation
+            # Count tokens from response
+            tokens = response.tokens_generated if hasattr(response, 'tokens_generated') else len(response.text.split()) * 1.3
             
             # Calculate metrics
             tps = tokens / gen_time if gen_time > 0 else 0
