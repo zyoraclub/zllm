@@ -202,6 +202,11 @@ class TransformerLayer(nn.Module):
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
         
+        # Ensure all tensors have same dtype
+        dtype = q.dtype
+        k = k.to(dtype)
+        v = v.to(dtype)
+        
         # Attention - use Flash Attention if available
         if self.use_flash_attention and q.is_cuda and attention_mask is None:
             # Flash Attention (memory efficient)
@@ -214,11 +219,12 @@ class TransformerLayer(nn.Module):
             if attention_mask is not None:
                 attn_weights = attn_weights + attention_mask
             
-            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
             attn_output = torch.matmul(attn_weights, v)
         
-        # Reshape back
+        # Reshape back - ensure correct dtype
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        attn_output = attn_output.to(self.o_proj.weight.dtype)
         attn_output = self.o_proj(attn_output)
         
         hidden_states = residual + attn_output
@@ -226,6 +232,9 @@ class TransformerLayer(nn.Module):
         # FFN
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        
+        # Ensure dtype matches for FFN
+        hidden_states = hidden_states.to(self.gate_proj.weight.dtype)
         
         # SwiGLU
         gate = F.silu(self.gate_proj(hidden_states))
@@ -280,6 +289,13 @@ class ZLLMInferenceEngine:
         self.max_seq_len = min(self.metadata.context_length, self.config.max_seq_len)
         self.head_dim = self.hidden_size // self.num_heads
         
+        # Infer vocab_size from embedding tensor if not in metadata
+        if self.vocab_size == 0:
+            for name in ["token_embd.weight", "model.embed_tokens.weight", "tok_embeddings.weight"]:
+                if name in self.parser.tensors:
+                    self.vocab_size = self.parser.tensors[name].shape[1]
+                    break
+        
         # Fix for models that don't report intermediate_size
         if self.intermediate_size == 0:
             self.intermediate_size = int(self.hidden_size * 2.6875)  # Common ratio
@@ -327,6 +343,19 @@ class ZLLMInferenceEngine:
         
         return self.parser.load_tensor(name, self.device).to(self.dtype)
     
+    def _load_linear_weight(self, name: str, expected_shape: tuple) -> torch.Tensor:
+        """Load a Linear layer weight, handling GGUF transpose convention."""
+        weight = self._load_tensor(name)
+        
+        # GGUF stores weights transposed compared to PyTorch convention
+        # PyTorch Linear: (out_features, in_features)
+        # GGUF: (in_features, out_features)
+        if weight.shape != expected_shape:
+            if weight.shape == (expected_shape[1], expected_shape[0]):
+                weight = weight.t().contiguous()
+        
+        return weight
+    
     def _load_embedding(self) -> nn.Embedding:
         """Load token embeddings."""
         # Try different naming conventions
@@ -340,6 +369,9 @@ class ZLLMInferenceEngine:
         for name in names:
             if name in self.parser.tensors:
                 weight = self._load_tensor(name)
+                # GGUF stores embeddings as (hidden_size, vocab_size), need to transpose
+                if weight.shape[0] == self.hidden_size and weight.shape[1] == self.vocab_size:
+                    weight = weight.t()
                 embed = nn.Embedding(self.vocab_size, self.hidden_size, device=self.device)
                 embed.weight.data = weight
                 return embed
@@ -357,6 +389,9 @@ class ZLLMInferenceEngine:
         for name in names:
             if name in self.parser.tensors:
                 weight = self._load_tensor(name)
+                # GGUF stores as (hidden_size, vocab_size), Linear expects (vocab_size, hidden_size)
+                if weight.shape[0] == self.hidden_size and weight.shape[1] == self.vocab_size:
+                    weight = weight.t()
                 lm_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False, device=self.device)
                 lm_head.weight.data = weight
                 return lm_head
@@ -396,34 +431,43 @@ class ZLLMInferenceEngine:
             intermediate_size=self.intermediate_size,
         ).to(self.device).to(self.dtype)
         
+        # Expected shapes for linear layers
+        q_shape = (self.num_heads * self.head_dim, self.hidden_size)
+        k_shape = (self.num_kv_heads * self.head_dim, self.hidden_size)
+        v_shape = (self.num_kv_heads * self.head_dim, self.hidden_size)
+        o_shape = (self.hidden_size, self.num_heads * self.head_dim)
+        gate_shape = (self.intermediate_size, self.hidden_size)
+        up_shape = (self.intermediate_size, self.hidden_size)
+        down_shape = (self.hidden_size, self.intermediate_size)
+        
         # Load weights
         prefix = f"model.layers.{layer_idx}"
         
         try:
             # Attention norms and projections
             layer.input_layernorm.weight.data = self._load_tensor(f"{prefix}.input_layernorm.weight")
-            layer.q_proj.weight.data = self._load_tensor(f"{prefix}.self_attn.q_proj.weight")
-            layer.k_proj.weight.data = self._load_tensor(f"{prefix}.self_attn.k_proj.weight")
-            layer.v_proj.weight.data = self._load_tensor(f"{prefix}.self_attn.v_proj.weight")
-            layer.o_proj.weight.data = self._load_tensor(f"{prefix}.self_attn.o_proj.weight")
+            layer.q_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.q_proj.weight", q_shape)
+            layer.k_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.k_proj.weight", k_shape)
+            layer.v_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.v_proj.weight", v_shape)
+            layer.o_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.o_proj.weight", o_shape)
             
             # FFN
             layer.post_attention_layernorm.weight.data = self._load_tensor(f"{prefix}.post_attention_layernorm.weight")
-            layer.gate_proj.weight.data = self._load_tensor(f"{prefix}.mlp.gate_proj.weight")
-            layer.up_proj.weight.data = self._load_tensor(f"{prefix}.mlp.up_proj.weight")
-            layer.down_proj.weight.data = self._load_tensor(f"{prefix}.mlp.down_proj.weight")
+            layer.gate_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.gate_proj.weight", gate_shape)
+            layer.up_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.up_proj.weight", up_shape)
+            layer.down_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.down_proj.weight", down_shape)
         except KeyError as e:
-            # Try alternative naming (e.g., for Qwen, Mistral)
+            # Try alternative naming (e.g., for llama.cpp naming)
             try:
                 layer.input_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_norm.weight")
-                layer.q_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_q.weight")
-                layer.k_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_k.weight")
-                layer.v_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_v.weight")
-                layer.o_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_output.weight")
+                layer.q_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_q.weight", q_shape)
+                layer.k_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_k.weight", k_shape)
+                layer.v_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_v.weight", v_shape)
+                layer.o_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_output.weight", o_shape)
                 layer.post_attention_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_norm.weight")
-                layer.gate_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_gate.weight")
-                layer.up_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_up.weight")
-                layer.down_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_down.weight")
+                layer.gate_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_gate.weight", gate_shape)
+                layer.up_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_up.weight", up_shape)
+                layer.down_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_down.weight", down_shape)
             except KeyError:
                 raise KeyError(f"Cannot load layer {layer_idx}: {e}")
         

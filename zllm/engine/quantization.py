@@ -170,134 +170,186 @@ def dequantize_q8_0(data: bytes, shape: Tuple[int, ...]) -> torch.Tensor:
 
 def dequantize_q4_k(data: bytes, shape: Tuple[int, ...]) -> torch.Tensor:
     """
-    Dequantize Q4_K format (used by Q4_K_M, Q4_K_S).
+    Dequantize Q4_K format (vectorized).
     
-    This is the most common format for good quality/size balance.
-    
-    Format: For each super-block of 256 values:
-    - 2 bytes: fp16 super-block scale (d)
-    - 2 bytes: fp16 super-block minimum (dmin)
-    - 12 bytes: scales for 8 sub-blocks (6-bit each, packed)
-    - 4 bytes: minimums for 8 sub-blocks (4-bit each, packed)
-    - 128 bytes: 256 4-bit quantized values packed
-    
-    Each sub-block (32 values): x = d * sc * q + dmin * m
+    Block size: 256, bytes per block: 144
+    Format: d (2) + dmin (2) + scales (12) + qs (128)
     """
     n_elements = 1
     for dim in shape:
         n_elements *= dim
     
-    super_block_size = 256
-    sub_block_size = 32
-    n_super_blocks = (n_elements + super_block_size - 1) // super_block_size
-    bytes_per_super_block = 144  # 2 + 2 + 12 + 4 + 128 - but actually it's more complex
+    block_size = 256
+    bytes_per_block = 144
+    n_blocks = (n_elements + block_size - 1) // block_size
     
-    result = np.zeros(n_elements, dtype=np.float32)
+    result = np.zeros(n_blocks * block_size, dtype=np.float32)
+    data_arr = np.frombuffer(data, dtype=np.uint8)
     
-    offset = 0
-    for sb_idx in range(n_super_blocks):
-        if offset + 2 > len(data):
+    for block_idx in range(n_blocks):
+        offset = block_idx * bytes_per_block
+        if offset + bytes_per_block > len(data_arr):
             break
-            
-        # Read super-block d and dmin
+        
+        # Read d and dmin
         d = struct.unpack("<e", data[offset:offset+2])[0]
-        offset += 2
-        dmin = struct.unpack("<e", data[offset:offset+2])[0]
-        offset += 2
+        dmin = struct.unpack("<e", data[offset+2:offset+4])[0]
         
-        # Read scales (12 bytes for 8 sub-blocks, 6-bit each)
-        scales = []
-        scale_bytes = data[offset:offset+12]
-        offset += 12
+        # Read scales/mins (12 bytes)
+        scales_bytes = data_arr[offset+4:offset+16]
         
-        # Decode 6-bit scales (packed in complex way)
+        # Decode scales and mins
+        scales = np.zeros(8, dtype=np.float32)
+        mins = np.zeros(8, dtype=np.float32)
         for i in range(8):
-            byte_idx = (i * 6) // 8
-            bit_offset = (i * 6) % 8
-            
-            if byte_idx < len(scale_bytes):
-                if bit_offset <= 2:
-                    sc = (scale_bytes[byte_idx] >> bit_offset) & 0x3F
-                else:
-                    sc = ((scale_bytes[byte_idx] >> bit_offset) | 
-                          (scale_bytes[byte_idx + 1] << (8 - bit_offset))) & 0x3F
-                scales.append(sc)
-            else:
-                scales.append(0)
+            scales[i] = scales_bytes[i] & 0x3F
+            mins[i] = (scales_bytes[8 + i // 2] >> (4 * (i % 2))) & 0x0F
         
-        # Read minimums (4 bytes for 8 sub-blocks, 4-bit each)
-        min_bytes = data[offset:offset+4]
-        offset += 4
+        # Read quantized values
+        qs = data_arr[offset+16:offset+144]
         
-        mins = []
-        for i in range(8):
-            byte_idx = i // 2
-            if byte_idx < len(min_bytes):
-                if i % 2 == 0:
-                    mins.append(min_bytes[byte_idx] & 0x0F)
-                else:
-                    mins.append((min_bytes[byte_idx] >> 4) & 0x0F)
-            else:
-                mins.append(0)
+        # Unpack 4-bit values (128 bytes -> 256 values)
+        q = np.zeros(256, dtype=np.float32)
+        q[0::2] = qs & 0x0F
+        q[1::2] = (qs >> 4) & 0x0F
         
-        # Read 128 bytes of packed 4-bit values
-        qs = data[offset:offset+128]
-        offset += 128
+        # Get scale/min for each value (8 sub-blocks of 32 values)
+        sc = scales.repeat(32)
+        m = mins.repeat(32)
         
-        # Dequantize each sub-block
-        for sub_idx in range(8):
-            sc = scales[sub_idx] if sub_idx < len(scales) else 1
-            m = mins[sub_idx] if sub_idx < len(mins) else 0
-            
-            for i in range(16):  # 16 bytes = 32 4-bit values
-                q_idx = sub_idx * 16 + i
-                if q_idx >= len(qs):
-                    break
-                    
-                byte = qs[q_idx]
-                q0 = byte & 0x0F
-                q1 = (byte >> 4) & 0x0F
-                
-                idx = sb_idx * 256 + sub_idx * 32 + i * 2
-                if idx < n_elements:
-                    result[idx] = d * sc * q0 + dmin * m
-                if idx + 1 < n_elements:
-                    result[idx + 1] = d * sc * q1 + dmin * m
+        # Dequantize: x = d * sc * q - dmin * m
+        out_start = block_idx * 256
+        out_end = min(out_start + 256, n_elements)
+        n_vals = out_end - out_start
+        result[out_start:out_end] = (d * sc[:n_vals] * q[:n_vals] - dmin * m[:n_vals])
     
-    return torch.from_numpy(result.reshape(shape))
+    return torch.from_numpy(result[:n_elements].reshape(shape))
 
 
 def dequantize_q5_k(data: bytes, shape: Tuple[int, ...]) -> torch.Tensor:
     """
-    Dequantize Q5_K format.
+    Dequantize Q5_K format (vectorized).
     
-    Similar to Q4_K but with 5-bit quantization.
+    Block size: 256, bytes per block: 176
+    Format: d (2) + dmin (2) + scales (12) + qh (32) + ql (128)
     """
-    # Q5_K is complex - for now, use simplified version
-    # TODO: Implement full Q5_K
     n_elements = 1
     for dim in shape:
         n_elements *= dim
     
-    # Placeholder - returns zeros
-    # Full implementation requires handling 5-bit packed values
-    result = np.zeros(n_elements, dtype=np.float32)
-    return torch.from_numpy(result.reshape(shape))
+    block_size = 256
+    bytes_per_block = 176
+    n_blocks = (n_elements + block_size - 1) // block_size
+    
+    result = np.zeros(n_blocks * block_size, dtype=np.float32)
+    data_arr = np.frombuffer(data, dtype=np.uint8)
+    
+    for block_idx in range(n_blocks):
+        offset = block_idx * bytes_per_block
+        if offset + bytes_per_block > len(data_arr):
+            break
+        
+        # Read d and dmin
+        d = struct.unpack("<e", data[offset:offset+2])[0]
+        dmin = struct.unpack("<e", data[offset+2:offset+4])[0]
+        
+        # Read scales (12 bytes)
+        scales_bytes = data_arr[offset+4:offset+16]
+        scales = np.zeros(8, dtype=np.float32)
+        mins = np.zeros(8, dtype=np.float32)
+        for i in range(8):
+            scales[i] = scales_bytes[i] & 0x3F
+            mins[i] = (scales_bytes[8 + i // 2] >> (4 * (i % 2))) & 0x0F
+        
+        # Read qh (32 bytes -> 256 high bits)
+        qh = data_arr[offset+16:offset+48]
+        
+        # Read ql (128 bytes -> 256 4-bit values)
+        ql = data_arr[offset+48:offset+176]
+        
+        # Unpack low 4 bits
+        q_lo = np.zeros(256, dtype=np.int32)
+        q_lo[0::2] = ql & 0x0F
+        q_lo[1::2] = (ql >> 4) & 0x0F
+        
+        # Unpack high bits
+        q_hi = np.zeros(256, dtype=np.int32)
+        for byte_idx in range(32):
+            for bit in range(8):
+                q_hi[byte_idx * 8 + bit] = (qh[byte_idx] >> bit) & 0x01
+        
+        # Combine to 5-bit
+        q = q_lo | (q_hi << 4)
+        
+        # Get scale/min for each value
+        sc = scales.repeat(32)
+        m = mins.repeat(32)
+        
+        # Dequantize
+        out_start = block_idx * 256
+        out_end = min(out_start + 256, n_elements)
+        n_vals = out_end - out_start
+        result[out_start:out_end] = (d * sc[:n_vals] * q[:n_vals] - dmin * m[:n_vals])
+    
+    return torch.from_numpy(result[:n_elements].reshape(shape))
 
 
 def dequantize_q6_k(data: bytes, shape: Tuple[int, ...]) -> torch.Tensor:
     """
-    Dequantize Q6_K format.
+    Dequantize Q6_K format (vectorized).
     
-    High quality 6-bit quantization.
+    Block size: 256, bytes per block: 210
+    Format: ql (128) + qh (64) + scales (16) + d (2)
     """
     n_elements = 1
     for dim in shape:
         n_elements *= dim
     
-    # Placeholder - full implementation needed
-    result = np.zeros(n_elements, dtype=np.float32)
-    return torch.from_numpy(result.reshape(shape))
+    block_size = 256
+    bytes_per_block = 210
+    n_blocks = (n_elements + block_size - 1) // block_size
+    
+    # Pre-allocate result
+    result = np.zeros(n_blocks * block_size, dtype=np.float32)
+    
+    # Process all blocks using numpy
+    data_arr = np.frombuffer(data, dtype=np.uint8)
+    
+    for block_idx in range(n_blocks):
+        offset = block_idx * bytes_per_block
+        if offset + bytes_per_block > len(data_arr):
+            break
+        
+        # Read ql, qh, scales, d
+        ql = data_arr[offset:offset+128]
+        qh = data_arr[offset+128:offset+192]
+        scales = data_arr[offset+192:offset+208].view(np.int8)
+        d_bytes = data[offset+208:offset+210]
+        d = struct.unpack("<e", d_bytes)[0]
+        
+        # Unpack 4-bit values from ql (128 bytes -> 256 4-bit values)
+        q_lo = np.zeros(256, dtype=np.int32)
+        q_lo[0::2] = ql & 0x0F
+        q_lo[1::2] = (ql >> 4) & 0x0F
+        
+        # Unpack 2-bit values from qh (64 bytes -> 256 2-bit values) 
+        q_hi = np.zeros(256, dtype=np.int32)
+        for i in range(4):
+            q_hi[i*64:(i+1)*64] = (qh >> (i*2)) & 0x03
+        
+        # Combine to 6-bit
+        q = q_lo | (q_hi << 4)
+        
+        # Get scales for each of 16 sub-blocks (16 values each)
+        sc = scales.repeat(16)
+        
+        # Dequantize
+        out_start = block_idx * 256
+        out_end = min(out_start + 256, n_elements)
+        n_vals = out_end - out_start
+        result[out_start:out_end] = (d * sc[:n_vals] * (q[:n_vals] - 32)).astype(np.float32)
+    
+    return torch.from_numpy(result[:n_elements].reshape(shape))
 
 
 def dequantize_q2_k(data: bytes, shape: Tuple[int, ...]) -> torch.Tensor:
