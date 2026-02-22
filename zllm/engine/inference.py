@@ -1,0 +1,646 @@
+"""
+ZLLM Native Inference Engine.
+
+Our own transformer inference implementation - no external dependencies.
+
+Features:
+- Layer-wise loading for memory efficiency
+- Supports any GGUF model
+- Custom CUDA kernels (optional)
+- PyTorch-native operations
+"""
+
+import math
+from typing import Optional, Dict, List, Tuple, Iterator, Any
+from dataclasses import dataclass
+from pathlib import Path
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .gguf_parser import GGUFParser, GGUFMetadata, GGUFTensor
+from .quantization import dequantize_tensor
+
+
+@dataclass
+class InferenceConfig:
+    """Configuration for inference."""
+    max_seq_len: int = 4096
+    max_batch_size: int = 1
+    temperature: float = 0.7
+    top_p: float = 0.9
+    top_k: int = 40
+    repetition_penalty: float = 1.1
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype: torch.dtype = torch.float16
+    
+    # Memory options
+    layer_offload: bool = False  # Offload layers to CPU when not in use
+    kv_cache_quantize: bool = True  # Quantize KV cache
+
+
+class RMSNorm(nn.Module):
+    """RMS Normalization (used by LLaMA, Qwen, etc.)."""
+    
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
+
+
+def precompute_rope_cache(
+    dim: int,
+    max_seq_len: int,
+    base: float = 10000.0,
+    device: str = "cpu",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Precompute RoPE sin/cos cache."""
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    t = torch.arange(max_seq_len, device=device).float()
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    
+    cos_cache = torch.cos(freqs)
+    sin_cache = torch.sin(freqs)
+    
+    return cos_cache, sin_cache
+
+
+def apply_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embeddings."""
+    # Get the relevant positions
+    cos = cos[position_ids]  # (batch, seq_len, dim//2)
+    sin = sin[position_ids]
+    
+    # Reshape for broadcasting
+    cos = cos.unsqueeze(1)  # (batch, 1, seq_len, dim//2)
+    sin = sin.unsqueeze(1)
+    
+    # Split into even and odd
+    q1, q2 = q[..., ::2], q[..., 1::2]
+    k1, k2 = k[..., ::2], k[..., 1::2]
+    
+    # Apply rotation
+    q_rotated = torch.cat([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1)
+    k_rotated = torch.cat([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1)
+    
+    return q_rotated, k_rotated
+
+
+class TransformerLayer(nn.Module):
+    """A single transformer layer."""
+    
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        intermediate_size: int,
+        rms_norm_eps: float = 1e-6,
+    ):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = hidden_size // num_heads
+        self.intermediate_size = intermediate_size
+        
+        # Attention
+        self.input_layernorm = RMSNorm(hidden_size, rms_norm_eps)
+        self.q_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=False)
+        
+        # FFN
+        self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Forward pass."""
+        batch_size, seq_len, _ = hidden_states.shape
+        
+        # Attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        
+        # QKV projections
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        
+        # Reshape for multi-head attention
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        
+        # Apply RoPE
+        q, k = apply_rope(q, k, cos, sin, position_ids)
+        
+        # KV cache
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+            k = torch.cat([k_cache, k], dim=2)
+            v = torch.cat([v_cache, v], dim=2)
+        
+        new_kv_cache = (k, v)
+        
+        # Repeat KV for GQA
+        if self.num_kv_heads < self.num_heads:
+            n_rep = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
+        
+        # Attention
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape back
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        attn_output = self.o_proj(attn_output)
+        
+        hidden_states = residual + attn_output
+        
+        # FFN
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        
+        # SwiGLU
+        gate = F.silu(self.gate_proj(hidden_states))
+        up = self.up_proj(hidden_states)
+        hidden_states = self.down_proj(gate * up)
+        
+        hidden_states = residual + hidden_states
+        
+        return hidden_states, new_kv_cache
+
+
+class ZLLMInferenceEngine:
+    """
+    ZLLM Native Inference Engine.
+    
+    Our own implementation - no external dependencies.
+    
+    Example:
+        engine = ZLLMInferenceEngine("model.gguf")
+        output = engine.generate("Hello, world!", max_tokens=100)
+        print(output)
+    """
+    
+    def __init__(
+        self,
+        model_path: str,
+        config: Optional[InferenceConfig] = None,
+    ):
+        """
+        Load a GGUF model for inference.
+        
+        Args:
+            model_path: Path to .gguf file
+            config: Inference configuration
+        """
+        self.config = config or InferenceConfig()
+        self.device = torch.device(self.config.device)
+        self.dtype = self.config.dtype
+        
+        # Parse GGUF file
+        print(f"Loading GGUF: {model_path}")
+        self.parser = GGUFParser(model_path)
+        self.metadata = self.parser.metadata
+        
+        # Model architecture params
+        self.hidden_size = self.metadata.embedding_length
+        self.num_layers = self.metadata.block_count
+        self.num_heads = self.metadata.attention_head_count
+        self.num_kv_heads = self.metadata.attention_head_count_kv or self.num_heads
+        self.vocab_size = self.metadata.vocab_size
+        self.intermediate_size = self.metadata.feed_forward_length
+        self.max_seq_len = min(self.metadata.context_length, self.config.max_seq_len)
+        self.head_dim = self.hidden_size // self.num_heads
+        
+        # Fix for models that don't report intermediate_size
+        if self.intermediate_size == 0:
+            self.intermediate_size = int(self.hidden_size * 2.6875)  # Common ratio
+        
+        print(f"Model: {self.metadata.architecture}")
+        print(f"Layers: {self.num_layers}, Hidden: {self.hidden_size}")
+        print(f"Heads: {self.num_heads}, KV Heads: {self.num_kv_heads}")
+        print(f"Vocab: {self.vocab_size}, Context: {self.max_seq_len}")
+        
+        # Load embeddings and output layers (always in memory)
+        self.embed_tokens = self._load_embedding()
+        self.lm_head = self._load_lm_head()
+        self.norm = self._load_final_norm()
+        
+        # Layers (loaded on demand for memory efficiency)
+        self.layers: List[Optional[TransformerLayer]] = [None] * self.num_layers
+        
+        # Precompute RoPE cache
+        rope_dim = self.metadata.rope_dimension_count or self.head_dim
+        self.cos_cache, self.sin_cache = precompute_rope_cache(
+            rope_dim,
+            self.max_seq_len,
+            self.metadata.rope_freq_base,
+            device=self.device,
+        )
+        
+        # KV cache
+        self.kv_cache: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * self.num_layers
+    
+    def _load_tensor(self, name: str) -> torch.Tensor:
+        """Load a tensor from GGUF file."""
+        if name not in self.parser.tensors:
+            # Try common name variations
+            variations = [
+                name,
+                name.replace("model.", ""),
+                f"model.{name}",
+            ]
+            for var in variations:
+                if var in self.parser.tensors:
+                    name = var
+                    break
+            else:
+                raise KeyError(f"Tensor not found: {name}")
+        
+        return self.parser.load_tensor(name, self.device).to(self.dtype)
+    
+    def _load_embedding(self) -> nn.Embedding:
+        """Load token embeddings."""
+        # Try different naming conventions
+        names = [
+            "model.embed_tokens.weight",
+            "embed_tokens.weight",
+            "token_embd.weight",
+            "transformer.wte.weight",
+        ]
+        
+        for name in names:
+            if name in self.parser.tensors:
+                weight = self._load_tensor(name)
+                embed = nn.Embedding(self.vocab_size, self.hidden_size, device=self.device)
+                embed.weight.data = weight
+                return embed
+        
+        raise KeyError(f"Embedding tensor not found. Available: {list(self.parser.tensors.keys())[:5]}")
+    
+    def _load_lm_head(self) -> nn.Linear:
+        """Load output projection (lm_head)."""
+        names = [
+            "lm_head.weight",
+            "model.lm_head.weight",
+            "output.weight",
+        ]
+        
+        for name in names:
+            if name in self.parser.tensors:
+                weight = self._load_tensor(name)
+                lm_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False, device=self.device)
+                lm_head.weight.data = weight
+                return lm_head
+        
+        # If no lm_head, use embedding weights (tied)
+        print("Note: Using tied embeddings for lm_head")
+        lm_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False, device=self.device)
+        lm_head.weight = self.embed_tokens.weight
+        return lm_head
+    
+    def _load_final_norm(self) -> RMSNorm:
+        """Load final layer norm."""
+        names = [
+            "model.norm.weight",
+            "norm.weight",
+            "output_norm.weight",
+        ]
+        
+        for name in names:
+            if name in self.parser.tensors:
+                weight = self._load_tensor(name)
+                norm = RMSNorm(self.hidden_size).to(self.device).to(self.dtype)
+                norm.weight.data = weight
+                return norm
+        
+        raise KeyError("Final norm tensor not found")
+    
+    def _load_layer(self, layer_idx: int) -> TransformerLayer:
+        """Load a transformer layer from GGUF."""
+        if self.layers[layer_idx] is not None:
+            return self.layers[layer_idx]
+        
+        layer = TransformerLayer(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            intermediate_size=self.intermediate_size,
+        ).to(self.device).to(self.dtype)
+        
+        # Load weights
+        prefix = f"model.layers.{layer_idx}"
+        
+        try:
+            # Attention norms and projections
+            layer.input_layernorm.weight.data = self._load_tensor(f"{prefix}.input_layernorm.weight")
+            layer.q_proj.weight.data = self._load_tensor(f"{prefix}.self_attn.q_proj.weight")
+            layer.k_proj.weight.data = self._load_tensor(f"{prefix}.self_attn.k_proj.weight")
+            layer.v_proj.weight.data = self._load_tensor(f"{prefix}.self_attn.v_proj.weight")
+            layer.o_proj.weight.data = self._load_tensor(f"{prefix}.self_attn.o_proj.weight")
+            
+            # FFN
+            layer.post_attention_layernorm.weight.data = self._load_tensor(f"{prefix}.post_attention_layernorm.weight")
+            layer.gate_proj.weight.data = self._load_tensor(f"{prefix}.mlp.gate_proj.weight")
+            layer.up_proj.weight.data = self._load_tensor(f"{prefix}.mlp.up_proj.weight")
+            layer.down_proj.weight.data = self._load_tensor(f"{prefix}.mlp.down_proj.weight")
+        except KeyError as e:
+            # Try alternative naming (e.g., for Qwen, Mistral)
+            try:
+                layer.input_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_norm.weight")
+                layer.q_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_q.weight")
+                layer.k_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_k.weight")
+                layer.v_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_v.weight")
+                layer.o_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_output.weight")
+                layer.post_attention_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_norm.weight")
+                layer.gate_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_gate.weight")
+                layer.up_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_up.weight")
+                layer.down_proj.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_down.weight")
+            except KeyError:
+                raise KeyError(f"Cannot load layer {layer_idx}: {e}")
+        
+        self.layers[layer_idx] = layer
+        return layer
+    
+    def _unload_layer(self, layer_idx: int) -> None:
+        """Unload a layer from GPU memory."""
+        if self.layers[layer_idx] is not None:
+            del self.layers[layer_idx]
+            self.layers[layer_idx] = None
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    def clear_kv_cache(self) -> None:
+        """Clear the KV cache."""
+        self.kv_cache = [None] * self.num_layers
+    
+    @torch.inference_mode()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
+        """
+        Forward pass through the model.
+        
+        Args:
+            input_ids: Token IDs (batch, seq_len)
+            position_ids: Position IDs (optional)
+            use_cache: Whether to use KV cache
+        
+        Returns:
+            Logits tensor (batch, seq_len, vocab_size)
+        """
+        batch_size, seq_len = input_ids.shape
+        
+        # Default position IDs
+        if position_ids is None:
+            if use_cache and self.kv_cache[0] is not None:
+                past_len = self.kv_cache[0][0].shape[2]
+                position_ids = torch.arange(
+                    past_len, past_len + seq_len, 
+                    device=self.device
+                ).unsqueeze(0).expand(batch_size, -1)
+            else:
+                position_ids = torch.arange(
+                    seq_len, device=self.device
+                ).unsqueeze(0).expand(batch_size, -1)
+        
+        # Causal mask
+        if seq_len > 1:
+            mask = torch.full(
+                (seq_len, seq_len), 
+                float("-inf"), 
+                device=self.device
+            )
+            mask = torch.triu(mask, diagonal=1)
+            
+            if use_cache and self.kv_cache[0] is not None:
+                past_len = self.kv_cache[0][0].shape[2]
+                mask = torch.cat([
+                    torch.zeros((seq_len, past_len), device=self.device),
+                    mask
+                ], dim=-1)
+            
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        else:
+            mask = None
+        
+        # Embedding
+        hidden_states = self.embed_tokens(input_ids)
+        
+        # Layers
+        for layer_idx in range(self.num_layers):
+            layer = self._load_layer(layer_idx)
+            
+            kv_cache = self.kv_cache[layer_idx] if use_cache else None
+            
+            hidden_states, new_kv_cache = layer(
+                hidden_states,
+                self.cos_cache,
+                self.sin_cache,
+                position_ids,
+                attention_mask=mask,
+                kv_cache=kv_cache,
+            )
+            
+            if use_cache:
+                self.kv_cache[layer_idx] = new_kv_cache
+            
+            # Optionally offload layer after use
+            if self.config.layer_offload:
+                self._unload_layer(layer_idx)
+        
+        # Final norm and output
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+        
+        return logits
+    
+    def sample_next_token(
+        self,
+        logits: torch.Tensor,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 40,
+    ) -> torch.Tensor:
+        """Sample next token from logits."""
+        logits = logits[:, -1, :]  # Last position
+        
+        if temperature == 0:
+            return logits.argmax(dim=-1, keepdim=True)
+        
+        logits = logits / temperature
+        
+        # Top-k filtering
+        if top_k > 0:
+            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits[indices_to_remove] = float("-inf")
+        
+        # Top-p (nucleus) filtering
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                -1, sorted_indices, sorted_indices_to_remove
+            )
+            logits[indices_to_remove] = float("-inf")
+        
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        
+        return next_token
+    
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt_tokens: List[int],
+        max_new_tokens: int = 256,
+        temperature: float = None,
+        top_p: float = None,
+        top_k: int = None,
+        stop_tokens: Optional[List[int]] = None,
+    ) -> List[int]:
+        """
+        Generate tokens from prompt.
+        
+        Args:
+            prompt_tokens: Input token IDs
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            top_k: Top-k sampling parameter
+            stop_tokens: Token IDs that stop generation
+        
+        Returns:
+            List of generated token IDs
+        """
+        temperature = temperature if temperature is not None else self.config.temperature
+        top_p = top_p if top_p is not None else self.config.top_p
+        top_k = top_k if top_k is not None else self.config.top_k
+        stop_tokens = stop_tokens or [self.metadata.eos_token_id]
+        
+        # Clear cache for new generation
+        self.clear_kv_cache()
+        
+        # Process prompt
+        input_ids = torch.tensor([prompt_tokens], device=self.device)
+        
+        # Prefill (process prompt)
+        logits = self.forward(input_ids, use_cache=True)
+        
+        # Generate
+        generated = list(prompt_tokens)
+        
+        for _ in range(max_new_tokens):
+            next_token = self.sample_next_token(
+                logits, temperature, top_p, top_k
+            )
+            
+            token_id = next_token.item()
+            generated.append(token_id)
+            
+            if token_id in stop_tokens:
+                break
+            
+            # Decode next token
+            logits = self.forward(next_token, use_cache=True)
+        
+        return generated
+    
+    def generate_stream(
+        self,
+        prompt_tokens: List[int],
+        max_new_tokens: int = 256,
+        **kwargs,
+    ) -> Iterator[int]:
+        """Stream generated tokens one at a time."""
+        temperature = kwargs.get("temperature", self.config.temperature)
+        top_p = kwargs.get("top_p", self.config.top_p)
+        top_k = kwargs.get("top_k", self.config.top_k)
+        stop_tokens = kwargs.get("stop_tokens", [self.metadata.eos_token_id])
+        
+        self.clear_kv_cache()
+        
+        input_ids = torch.tensor([prompt_tokens], device=self.device)
+        logits = self.forward(input_ids, use_cache=True)
+        
+        for _ in range(max_new_tokens):
+            next_token = self.sample_next_token(logits, temperature, top_p, top_k)
+            token_id = next_token.item()
+            
+            yield token_id
+            
+            if token_id in stop_tokens:
+                break
+            
+            logits = self.forward(next_token, use_cache=True)
+    
+    def close(self) -> None:
+        """Release resources."""
+        self.parser.close()
+        self.clear_kv_cache()
+        
+        # Free layers
+        for i in range(self.num_layers):
+            self._unload_layer(i)
+
+
+def load_engine(
+    model_path: str,
+    device: str = "auto",
+    **kwargs,
+) -> ZLLMInferenceEngine:
+    """
+    Load a GGUF model with our native engine.
+    
+    Args:
+        model_path: Path to .gguf file
+        device: Device ('auto', 'cuda', 'cpu')
+        **kwargs: Additional config options
+    
+    Returns:
+        ZLLMInferenceEngine instance
+    """
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    config = InferenceConfig(device=device, **kwargs)
+    return ZLLMInferenceEngine(model_path, config)
