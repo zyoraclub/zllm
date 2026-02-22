@@ -56,6 +56,13 @@ class ZLLMConfig:
     quantization: Optional[Literal["int4", "int8", "none"]] = None
     auto_quantize: bool = True  # Auto-select quantization based on available memory
     
+    # Backend selection (for inference optimization)
+    # "bitsandbytes": Standard HuggingFace quantization (default)
+    # "awq": AWQ quantization (faster, requires auto-awq)
+    # "gptq": GPTQ quantization (accurate, requires auto-gptq)
+    # "gguf": GGUF format via llama.cpp (fastest, requires llama-cpp-python)
+    backend: Literal["bitsandbytes", "awq", "gptq", "gguf"] = "bitsandbytes"
+    
     # Memory management
     enable_layer_streaming: bool = True
     max_layers_in_memory: Optional[int] = None

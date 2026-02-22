@@ -2,12 +2,13 @@
 Model loader with SafeTensors and HuggingFace Hub support.
 
 Supports layer-wise loading for memory efficiency.
+Supports multiple quantization backends: bitsandbytes, AWQ, GPTQ, GGUF.
 """
 
 import os
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Generator, Tuple
+from typing import Optional, Dict, Any, List, Generator, Tuple, Union
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -18,6 +19,27 @@ try:
     SAFETENSORS_AVAILABLE = True
 except ImportError:
     SAFETENSORS_AVAILABLE = False
+
+# AWQ support
+try:
+    from awq import AutoAWQForCausalLM
+    AWQ_AVAILABLE = True
+except ImportError:
+    AWQ_AVAILABLE = False
+
+# GPTQ support
+try:
+    from auto_gptq import AutoGPTQForCausalLM
+    GPTQ_AVAILABLE = True
+except ImportError:
+    GPTQ_AVAILABLE = False
+
+# GGUF/llama.cpp support
+try:
+    from llama_cpp import Llama
+    GGUF_AVAILABLE = True
+except ImportError:
+    GGUF_AVAILABLE = False
 
 from huggingface_hub import hf_hub_download, snapshot_download, HfApi
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
@@ -196,18 +218,88 @@ class ModelLoader:
             trust_remote_code=self.trust_remote_code,
         )
     
+    def detect_backend(self, model_id: str) -> str:
+        """
+        Auto-detect the best backend for a model based on its name/path.
+        
+        Returns:
+            One of: 'awq', 'gptq', 'gguf', 'bitsandbytes'
+        """
+        model_id_lower = model_id.lower()
+        
+        # Check for GGUF file
+        if model_id_lower.endswith('.gguf') or Path(model_id).suffix == '.gguf':
+            if GGUF_AVAILABLE:
+                return 'gguf'
+            else:
+                raise ImportError("GGUF file detected but llama-cpp-python is not installed. "
+                                "Install with: pip install llama-cpp-python")
+        
+        # Check for AWQ model
+        if 'awq' in model_id_lower or '-awq' in model_id_lower:
+            if AWQ_AVAILABLE:
+                return 'awq'
+            else:
+                raise ImportError("AWQ model detected but auto-awq is not installed. "
+                                "Install with: pip install autoawq")
+        
+        # Check for GPTQ model
+        if 'gptq' in model_id_lower or '-gptq' in model_id_lower:
+            if GPTQ_AVAILABLE:
+                return 'gptq'
+            else:
+                raise ImportError("GPTQ model detected but auto-gptq is not installed. "
+                                "Install with: pip install auto-gptq")
+        
+        # Default to bitsandbytes
+        return 'bitsandbytes'
+    
+    def get_available_backends(self) -> Dict[str, bool]:
+        """Return availability status of all backends."""
+        return {
+            'bitsandbytes': True,  # Always available via transformers
+            'awq': AWQ_AVAILABLE,
+            'gptq': GPTQ_AVAILABLE,
+            'gguf': GGUF_AVAILABLE,
+        }
+    
     def load_model_full(
         self,
         model_id: str,
         device_map: str = "auto",
         dtype: torch.dtype = torch.float16,
         quantization: Optional[str] = None,
-    ) -> nn.Module:
+        backend: Optional[str] = None,
+    ) -> Union[nn.Module, Any]:
         """
-        Load a complete model (standard loading).
+        Load a complete model with support for multiple backends.
         
-        For memory-efficient loading, use load_model_layerwise instead.
+        Args:
+            model_id: HuggingFace model ID, local path, or GGUF file path
+            device_map: Device mapping strategy
+            dtype: Data type for model weights
+            quantization: Quantization mode for bitsandbytes ('int8', 'int4')
+            backend: Force a specific backend ('awq', 'gptq', 'gguf', 'bitsandbytes')
+                     If None, auto-detects from model name
+        
+        Returns:
+            Loaded model (type depends on backend)
         """
+        # Auto-detect backend if not specified
+        if backend is None:
+            backend = self.detect_backend(model_id)
+        
+        # Load based on backend
+        if backend == 'gguf':
+            return self.load_model_gguf(model_id)
+        
+        if backend == 'awq':
+            return self.load_model_awq(model_id, device_map)
+        
+        if backend == 'gptq':
+            return self.load_model_gptq(model_id, device_map)
+        
+        # Default: bitsandbytes via transformers
         load_kwargs = {
             "pretrained_model_name_or_path": model_id,
             "cache_dir": self.cache_dir,
@@ -230,6 +322,120 @@ class ModelLoader:
                 load_kwargs["load_in_4bit"] = True
         
         return AutoModelForCausalLM.from_pretrained(**load_kwargs)
+    
+    def load_model_awq(
+        self,
+        model_id: str,
+        device_map: str = "auto",
+    ) -> Any:
+        """
+        Load an AWQ quantized model.
+        
+        AWQ (Activation-aware Weight Quantization) provides fast inference
+        with 4-bit quantization. Typically 2x faster than bitsandbytes.
+        
+        Args:
+            model_id: HuggingFace model ID for AWQ model
+                     (e.g., "TheBloke/Llama-2-7B-Chat-AWQ")
+            device_map: Device mapping strategy
+        
+        Returns:
+            AWQ model ready for inference
+        """
+        if not AWQ_AVAILABLE:
+            raise ImportError(
+                "auto-awq is required for AWQ models. "
+                "Install with: pip install autoawq"
+            )
+        
+        model = AutoAWQForCausalLM.from_quantized(
+            model_id,
+            fuse_layers=True,  # Fused layers for faster inference
+            trust_remote_code=self.trust_remote_code,
+            safetensors=True,
+        )
+        return model
+    
+    def load_model_gptq(
+        self,
+        model_id: str,
+        device_map: str = "auto",
+    ) -> Any:
+        """
+        Load a GPTQ quantized model.
+        
+        GPTQ provides accurate 4-bit quantization with good inference speed.
+        
+        Args:
+            model_id: HuggingFace model ID for GPTQ model
+                     (e.g., "TheBloke/Llama-2-7B-Chat-GPTQ")
+            device_map: Device mapping strategy
+        
+        Returns:
+            GPTQ model ready for inference
+        """
+        if not GPTQ_AVAILABLE:
+            raise ImportError(
+                "auto-gptq is required for GPTQ models. "
+                "Install with: pip install auto-gptq"
+            )
+        
+        model = AutoGPTQForCausalLM.from_quantized(
+            model_id,
+            device="cuda:0",
+            trust_remote_code=self.trust_remote_code,
+            use_safetensors=True,
+        )
+        return model
+    
+    def load_model_gguf(
+        self,
+        model_path: str,
+        n_ctx: int = 4096,
+        n_gpu_layers: int = -1,
+        verbose: bool = False,
+    ) -> Any:
+        """
+        Load a GGUF model using llama.cpp.
+        
+        GGUF models are highly optimized and can run on CPU or GPU.
+        Typically 3-4x faster than bitsandbytes.
+        
+        Args:
+            model_path: Path to .gguf file (local or HuggingFace)
+            n_ctx: Context window size
+            n_gpu_layers: Number of layers to offload to GPU (-1 = all)
+            verbose: Enable verbose output
+        
+        Returns:
+            Llama model ready for inference
+        """
+        if not GGUF_AVAILABLE:
+            raise ImportError(
+                "llama-cpp-python is required for GGUF models. "
+                "Install with: pip install llama-cpp-python"
+            )
+        
+        # If it's a HuggingFace repo, download the GGUF file
+        if not Path(model_path).exists() and '/' in model_path:
+            # Try to find GGUF file in HuggingFace repo
+            try:
+                # This handles repos like "TheBloke/Llama-2-7B-Chat-GGUF"
+                model_path = hf_hub_download(
+                    repo_id=model_path.rsplit('/', 1)[0] if '.gguf' not in model_path else model_path.rsplit('/', 2)[0],
+                    filename=model_path.rsplit('/', 1)[-1] if '.gguf' in model_path else None,
+                    cache_dir=self.cache_dir,
+                )
+            except Exception:
+                pass  # If download fails, try using the path directly
+        
+        model = Llama(
+            model_path=str(model_path),
+            n_ctx=n_ctx,
+            n_gpu_layers=n_gpu_layers,
+            verbose=verbose,
+        )
+        return model
     
     def iter_layers_safetensors(
         self,

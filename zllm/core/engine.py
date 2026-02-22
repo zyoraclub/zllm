@@ -206,13 +206,15 @@ class ZLLM:
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task(f"Loading {model_id}...", total=None)
+            backend = getattr(self.config, 'backend', 'bitsandbytes')
+            task = progress.add_task(f"Loading {model_id} ({backend})...", total=None)
             
             self.model = self.loader.load_model_full(
                 model_id,
                 device_map=self.config.device_map,
                 dtype=torch.float16,
                 quantization=quant,
+                backend=backend,
             )
             
             progress.update(task, description="Model loaded")

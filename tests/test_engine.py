@@ -115,3 +115,94 @@ class TestQuantization:
             available_memory_gb=16,
         )
         assert config.quant_type == QuantizationType.INT4
+
+
+class TestBackendDetection:
+    """Tests for backend detection and loading."""
+    
+    def test_detect_backend_standard(self):
+        """Test detection of standard models."""
+        from zllm.models.loader import ModelLoader
+        
+        loader = ModelLoader()
+        
+        # Standard model should use bitsandbytes
+        assert loader.detect_backend("meta-llama/Llama-2-7b-chat-hf") == "bitsandbytes"
+        assert loader.detect_backend("Qwen/Qwen2-7B-Instruct") == "bitsandbytes"
+    
+    def test_detect_backend_awq(self):
+        """Test detection of AWQ models."""
+        from zllm.models.loader import ModelLoader, AWQ_AVAILABLE
+        
+        loader = ModelLoader()
+        
+        if AWQ_AVAILABLE:
+            assert loader.detect_backend("TheBloke/Llama-2-7B-Chat-AWQ") == "awq"
+            assert loader.detect_backend("Qwen2-7B-Instruct-AWQ") == "awq"
+        else:
+            # Should raise ImportError for AWQ models without library
+            try:
+                loader.detect_backend("TheBloke/Llama-2-7B-Chat-AWQ")
+                assert False, "Should have raised ImportError"
+            except ImportError as e:
+                assert "auto-awq" in str(e)
+    
+    def test_detect_backend_gptq(self):
+        """Test detection of GPTQ models."""
+        from zllm.models.loader import ModelLoader, GPTQ_AVAILABLE
+        
+        loader = ModelLoader()
+        
+        if GPTQ_AVAILABLE:
+            assert loader.detect_backend("TheBloke/Llama-2-7B-Chat-GPTQ") == "gptq"
+        else:
+            try:
+                loader.detect_backend("TheBloke/Llama-2-7B-Chat-GPTQ")
+                assert False, "Should have raised ImportError"
+            except ImportError as e:
+                assert "auto-gptq" in str(e)
+    
+    def test_detect_backend_gguf(self):
+        """Test detection of GGUF files."""
+        from zllm.models.loader import ModelLoader, GGUF_AVAILABLE
+        
+        loader = ModelLoader()
+        
+        if GGUF_AVAILABLE:
+            assert loader.detect_backend("model.gguf") == "gguf"
+            assert loader.detect_backend("/path/to/llama-2-7b-q4_0.gguf") == "gguf"
+        else:
+            try:
+                loader.detect_backend("model.gguf")
+                assert False, "Should have raised ImportError"
+            except ImportError as e:
+                assert "llama-cpp-python" in str(e)
+    
+    def test_get_available_backends(self):
+        """Test backend availability reporting."""
+        from zllm.models.loader import ModelLoader
+        
+        loader = ModelLoader()
+        backends = loader.get_available_backends()
+        
+        assert "bitsandbytes" in backends
+        assert "awq" in backends
+        assert "gptq" in backends
+        assert "gguf" in backends
+        # bitsandbytes is always available
+        assert backends["bitsandbytes"] is True
+    
+    def test_config_backend_field(self):
+        """Test ZLLMConfig backend field."""
+        from zllm import ZLLMConfig
+        
+        # Default should be bitsandbytes
+        config = ZLLMConfig()
+        assert config.backend == "bitsandbytes"
+        
+        # Should accept other backends
+        config = ZLLMConfig(backend="awq")
+        assert config.backend == "awq"
+        
+        config = ZLLMConfig(backend="gguf")
+        assert config.backend == "gguf"

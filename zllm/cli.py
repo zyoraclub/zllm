@@ -43,42 +43,104 @@ def get_memory_bar(used: float, total: float, width: int = 20) -> str:
     return f"[{color}]{bar}[/{color}] {pct*100:.0f}%"
 
 
-def smart_loader_menu(model_id: str, model_size_gb: float, gpu_memory_gb: float) -> Optional[str]:
+def smart_loader_menu(model_id: str, model_size_gb: float, gpu_memory_gb: float) -> dict:
     """
     Show smart loader menu to let user choose loading strategy BEFORE loading.
     
     Returns:
-        quantization setting: None (FP16), "int8", or "int4"
+        dict with keys: 'backend', 'quantization'
+        - backend: 'bitsandbytes', 'awq', 'gptq', 'gguf'
+        - quantization: None (FP16), "int8", or "int4" (only for bitsandbytes)
     """
-    # Calculate what fits
+    from zllm.models.loader import AWQ_AVAILABLE, GPTQ_AVAILABLE, GGUF_AVAILABLE
+    
+    model_lower = model_id.lower()
+    
+    # Detect if this is a pre-quantized model
+    is_awq_model = 'awq' in model_lower or '-awq' in model_lower
+    is_gptq_model = 'gptq' in model_lower or '-gptq' in model_lower
+    is_gguf_model = model_id.endswith('.gguf')
+    
+    # Calculate what fits for bitsandbytes
     fp16_fits = model_size_gb * 1.2 <= gpu_memory_gb  # 20% overhead
     int8_fits = model_size_gb * 0.6 <= gpu_memory_gb  # INT8 ≈ 50% + overhead
     int4_fits = model_size_gb * 0.35 <= gpu_memory_gb  # INT4 ≈ 25% + overhead
+    
+    # AWQ/GPTQ models are already 4-bit, need ~25-30% of original
+    awq_fits = model_size_gb * 0.35 <= gpu_memory_gb
     
     # Estimate VRAM usage
     fp16_vram = f"{model_size_gb:.0f}GB"
     int8_vram = f"{model_size_gb * 0.5:.0f}GB"
     int4_vram = f"{model_size_gb * 0.25:.0f}GB"
+    awq_vram = f"{model_size_gb * 0.3:.0f}GB"
     
-    # Build options
+    # Build options based on model type
     options = []
     recommended = None
     
-    if fp16_fits:
-        options.append(("1", "⚡ SPEED", fp16_vram, "Fastest responses", "Best quality", None))
-        recommended = "1"
+    if is_awq_model:
+        # AWQ model - show AWQ option
+        if AWQ_AVAILABLE and awq_fits:
+            options.append(("1", "⚡ AWQ", awq_vram, "Fast 4-bit inference", "2x faster", "awq", None))
+            recommended = "1"
+        elif not AWQ_AVAILABLE:
+            console.print("[yellow]⚠ AWQ model detected but auto-awq not installed[/yellow]")
+            console.print("[dim]Install with: pip install autoawq[/dim]")
+        # Also offer bitsandbytes as fallback
+        if int4_fits:
+            opt_num = str(len(options) + 1)
+            options.append((opt_num, "💾 INT4", int4_vram, "Memory efficient", "Good quality", "bitsandbytes", "int4"))
+            if recommended is None:
+                recommended = opt_num
     
-    if int8_fits:
-        opt_num = str(len(options) + 1)
-        options.append((opt_num, "🎯 BALANCED", int8_vram, "Great performance", "Recommended", "int8"))
-        if recommended is None:
-            recommended = opt_num
+    elif is_gptq_model:
+        # GPTQ model - show GPTQ option
+        if GPTQ_AVAILABLE and awq_fits:
+            options.append(("1", "⚡ GPTQ", awq_vram, "Fast 4-bit inference", "Accurate", "gptq", None))
+            recommended = "1"
+        elif not GPTQ_AVAILABLE:
+            console.print("[yellow]⚠ GPTQ model detected but auto-gptq not installed[/yellow]")
+            console.print("[dim]Install with: pip install auto-gptq[/dim]")
+        # Also offer bitsandbytes as fallback
+        if int4_fits:
+            opt_num = str(len(options) + 1)
+            options.append((opt_num, "💾 INT4", int4_vram, "Memory efficient", "Good quality", "bitsandbytes", "int4"))
+            if recommended is None:
+                recommended = opt_num
     
-    if int4_fits:
-        opt_num = str(len(options) + 1)
-        options.append((opt_num, "💾 MEMORY", int4_vram, "Max memory saving", "Good quality", "int4"))
-        if recommended is None:
-            recommended = opt_num
+    elif is_gguf_model:
+        # GGUF file - use llama.cpp
+        if GGUF_AVAILABLE:
+            options.append(("1", "⚡ GGUF", "Auto", "Native llama.cpp", "Very fast", "gguf", None))
+            recommended = "1"
+        else:
+            console.print("[red]GGUF file detected but llama-cpp-python not installed[/red]")
+            console.print("[dim]Install with: pip install llama-cpp-python[/dim]")
+            return None
+    
+    else:
+        # Standard model - show bitsandbytes options
+        if fp16_fits:
+            options.append(("1", "⚡ SPEED", fp16_vram, "Fastest responses", "Best quality", "bitsandbytes", None))
+            recommended = "1"
+        
+        if int8_fits:
+            opt_num = str(len(options) + 1)
+            options.append((opt_num, "🎯 BALANCED", int8_vram, "Great performance", "Recommended", "bitsandbytes", "int8"))
+            if recommended is None:
+                recommended = opt_num
+        
+        if int4_fits:
+            opt_num = str(len(options) + 1)
+            options.append((opt_num, "💾 MEMORY", int4_vram, "Max memory saving", "Good quality", "bitsandbytes", "int4"))
+            if recommended is None:
+                recommended = opt_num
+        
+        # Show AWQ/GPTQ alternatives if available
+        if AWQ_AVAILABLE and awq_fits:
+            opt_num = str(len(options) + 1)
+            options.append((opt_num, "🚀 AWQ", awq_vram, "Need AWQ model", "Faster option", "awq_info", None))
     
     if not options:
         console.print("[red]Error: Model too large for available GPU memory![/red]")
@@ -98,7 +160,7 @@ def smart_loader_menu(model_id: str, model_size_gb: float, gpu_memory_gb: float)
     console.print("║" + " " * 68 + "║")
     
     for opt in options:
-        num, name, vram, perf, quality, _ = opt
+        num, name, vram, perf, quality, backend, _ = opt
         # Mark recommended
         rec_mark = " ◄ recommended" if num == recommended else ""
         line = f"  [{num}] {name:12} │ {vram:>5} VRAM │ {perf:18} │ {quality}"
@@ -106,6 +168,19 @@ def smart_loader_menu(model_id: str, model_size_gb: float, gpu_memory_gb: float)
         console.print(f"║{line}[green]{rec_mark}[/green]" + " " * max(0, padding) + "║")
     
     console.print("║" + " " * 68 + "║")
+    
+    # Show backend availability hint
+    backends_hint = []
+    if AWQ_AVAILABLE:
+        backends_hint.append("[green]AWQ✓[/green]")
+    if GPTQ_AVAILABLE:
+        backends_hint.append("[green]GPTQ✓[/green]")
+    if GGUF_AVAILABLE:
+        backends_hint.append("[green]GGUF✓[/green]")
+    if backends_hint:
+        hint_line = f"║  Backends: {' '.join(backends_hint)}"
+        console.print(hint_line + " " * (69 - len(hint_line.replace('[green]', '').replace('[/green]', ''))) + "║")
+    
     console.print("╚" + "═" * 68 + "╝")
     console.print()
     
@@ -121,15 +196,24 @@ def smart_loader_menu(model_id: str, model_size_gb: float, gpu_memory_gb: float)
     if choice == "":
         choice = recommended
     
-    # Find the quantization for chosen option
+    # Find the settings for chosen option
     for opt in options:
         if opt[0] == choice:
             chosen_name = opt[1]
-            chosen_quant = opt[5]
+            chosen_backend = opt[5]
+            chosen_quant = opt[6]
+            
+            # Handle AWQ info option (not a real backend)
+            if chosen_backend == "awq_info":
+                console.print("\n[yellow]💡 Tip: For fastest inference, use an AWQ model:[/yellow]")
+                console.print("[dim]   e.g., TheBloke/Llama-2-7B-Chat-AWQ[/dim]\n")
+                # Fall back to INT4
+                return {"backend": "bitsandbytes", "quantization": "int4"}
+            
             console.print(f"\n[green]✓ Selected: {chosen_name}[/green]\n")
-            return chosen_quant
+            return {"backend": chosen_backend, "quantization": chosen_quant}
     
-    return "int8"  # Fallback
+    return {"backend": "bitsandbytes", "quantization": "int8"}  # Fallback
 
 
 def get_model_size_estimate(model_id: str) -> float:
@@ -324,6 +408,7 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
     
     # === SMART LOADER: Show options BEFORE loading ===
     quantization = None
+    backend = "bitsandbytes"
     
     # Detect GPU
     if torch.cuda.is_available():
@@ -331,10 +416,13 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
         model_size_gb = get_model_size_estimate(model_id)
         
         # Show smart loader menu
-        quantization = smart_loader_menu(model_id, model_size_gb, gpu_memory_gb)
+        loader_config = smart_loader_menu(model_id, model_size_gb, gpu_memory_gb)
         
-        if quantization is False:  # User cancelled or error
+        if loader_config is None:  # User cancelled or error
             return
+        
+        backend = loader_config.get("backend", "bitsandbytes")
+        quantization = loader_config.get("quantization")
     else:
         # CPU mode - use INT8 by default for memory efficiency
         console.print("[yellow]No GPU detected, running on CPU with INT8 quantization[/yellow]")
@@ -355,6 +443,7 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
         model_id=model_id, 
         speed_mode=speed,
         quantization=quantization,
+        backend=backend,  # Pass the backend
         auto_quantize=False,  # User already chose
         enable_speculative=draft_model_id is not None,
         draft_model_id=draft_model_id,
