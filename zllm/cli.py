@@ -43,6 +43,122 @@ def get_memory_bar(used: float, total: float, width: int = 20) -> str:
     return f"[{color}]{bar}[/{color}] {pct*100:.0f}%"
 
 
+def smart_loader_menu(model_id: str, model_size_gb: float, gpu_memory_gb: float) -> Optional[str]:
+    """
+    Show smart loader menu to let user choose loading strategy BEFORE loading.
+    
+    Returns:
+        quantization setting: None (FP16), "int8", or "int4"
+    """
+    # Calculate what fits
+    fp16_fits = model_size_gb * 1.2 <= gpu_memory_gb  # 20% overhead
+    int8_fits = model_size_gb * 0.6 <= gpu_memory_gb  # INT8 ≈ 50% + overhead
+    int4_fits = model_size_gb * 0.35 <= gpu_memory_gb  # INT4 ≈ 25% + overhead
+    
+    # Estimate VRAM usage
+    fp16_vram = f"{model_size_gb:.0f}GB"
+    int8_vram = f"{model_size_gb * 0.5:.0f}GB"
+    int4_vram = f"{model_size_gb * 0.25:.0f}GB"
+    
+    # Build options
+    options = []
+    recommended = None
+    
+    if fp16_fits:
+        options.append(("1", "⚡ SPEED", fp16_vram, "Fastest responses", "Best quality", None))
+        recommended = "1"
+    
+    if int8_fits:
+        opt_num = str(len(options) + 1)
+        options.append((opt_num, "🎯 BALANCED", int8_vram, "Great performance", "Recommended", "int8"))
+        if recommended is None:
+            recommended = opt_num
+    
+    if int4_fits:
+        opt_num = str(len(options) + 1)
+        options.append((opt_num, "💾 MEMORY", int4_vram, "Max memory saving", "Good quality", "int4"))
+        if recommended is None:
+            recommended = opt_num
+    
+    if not options:
+        console.print("[red]Error: Model too large for available GPU memory![/red]")
+        console.print(f"[dim]Model needs ~{int4_vram} minimum, GPU has {gpu_memory_gb:.1f}GB[/dim]")
+        return None
+    
+    # Display the smart loader menu
+    console.print()
+    console.print("╔" + "═" * 68 + "╗")
+    console.print("║  [bold cyan]🧠 ZLLM Smart Loader[/bold cyan]" + " " * 46 + "║")
+    console.print("╠" + "═" * 68 + "╣")
+    console.print(f"║  Model: [green]{model_id[:45]}[/green]" + " " * max(0, 45 - len(model_id[:45])) + "║")
+    console.print(f"║  Your GPU: [cyan]{gpu_memory_gb:.1f}GB VRAM available[/cyan]" + " " * 35 + "║")
+    console.print("╠" + "═" * 68 + "╣")
+    console.print("║" + " " * 68 + "║")
+    console.print("║  [bold]📊 Loading Options:[/bold]" + " " * 46 + "║")
+    console.print("║" + " " * 68 + "║")
+    
+    for opt in options:
+        num, name, vram, perf, quality, _ = opt
+        # Mark recommended
+        rec_mark = " ◄ recommended" if num == recommended else ""
+        line = f"  [{num}] {name:12} │ {vram:>5} VRAM │ {perf:18} │ {quality}"
+        padding = 68 - len(line) - len(rec_mark) - 2
+        console.print(f"║{line}[green]{rec_mark}[/green]" + " " * max(0, padding) + "║")
+    
+    console.print("║" + " " * 68 + "║")
+    console.print("╚" + "═" * 68 + "╝")
+    console.print()
+    
+    # Get user choice
+    valid_choices = [opt[0] for opt in options]
+    choice = Prompt.ask(
+        f"Choose [{'/'.join(valid_choices)}] or Enter for recommended",
+        choices=valid_choices + [""],
+        default="",
+        show_choices=False,
+    )
+    
+    if choice == "":
+        choice = recommended
+    
+    # Find the quantization for chosen option
+    for opt in options:
+        if opt[0] == choice:
+            chosen_name = opt[1]
+            chosen_quant = opt[5]
+            console.print(f"\n[green]✓ Selected: {chosen_name}[/green]\n")
+            return chosen_quant
+    
+    return "int8"  # Fallback
+
+
+def get_model_size_estimate(model_id: str) -> float:
+    """
+    Estimate model size in GB based on model name/id.
+    This is a quick heuristic before actually downloading model info.
+    """
+    model_lower = model_id.lower()
+    
+    # Known model sizes (approximate FP16)
+    size_patterns = [
+        ("70b", 140), ("65b", 130), ("40b", 80),
+        ("34b", 68), ("33b", 66), ("30b", 60),
+        ("27b", 54), ("24b", 48), ("22b", 44),
+        ("14b", 28), ("13b", 26), ("12b", 24),
+        ("11b", 22), ("9b", 18), ("8b", 16),
+        ("7b", 14), ("6b", 12), ("5b", 10),
+        ("3b", 6), ("2b", 4), ("1.5b", 3), ("1b", 2),
+        ("0.5b", 1), ("500m", 1),
+    ]
+    
+    for pattern, size in size_patterns:
+        if pattern in model_lower:
+            return size
+    
+    # Default guess for unknown models
+    return 14  # Assume 7B
+
+
 @click.group(invoke_without_command=True)
 @click.option("--version", is_flag=True, help="Show version")
 @click.pass_context
@@ -189,6 +305,8 @@ def run(model: str, prompt: Optional[str], system: Optional[str], stream: bool, 
 def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], stream: bool, speed: str = "balanced", speculative: Optional[str] = None):
     """Implementation of the run command."""
     from zllm import ZLLM, ZLLMConfig
+    from zllm.hardware.auto_detect import detect_hardware
+    import torch
     
     # Resolve model aliases
     model_aliases = {
@@ -204,10 +322,40 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
     model_id = model_aliases.get(model.lower(), model)
     draft_model_id = model_aliases.get(speculative.lower(), speculative) if speculative else None
     
-    # Configure with speculative decoding if requested
+    # === SMART LOADER: Show options BEFORE loading ===
+    quantization = None
+    
+    # Detect GPU
+    if torch.cuda.is_available():
+        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        model_size_gb = get_model_size_estimate(model_id)
+        
+        # Show smart loader menu
+        quantization = smart_loader_menu(model_id, model_size_gb, gpu_memory_gb)
+        
+        if quantization is False:  # User cancelled or error
+            return
+    else:
+        # CPU mode - use INT8 by default for memory efficiency
+        console.print("[yellow]No GPU detected, running on CPU with INT8 quantization[/yellow]")
+        quantization = "int8"
+    
+    # Map speed mode based on quantization choice
+    if quantization is None:
+        speed = "fast"  # FP16 = fastest
+    elif quantization == "int8":
+        speed = "balanced"
+    else:
+        speed = "memory"
+    
+    # === END SMART LOADER ===
+    
+    # Configure with user's choice
     config = ZLLMConfig(
         model_id=model_id, 
         speed_mode=speed,
+        quantization=quantization,
+        auto_quantize=False,  # User already chose
         enable_speculative=draft_model_id is not None,
         draft_model_id=draft_model_id,
     )
@@ -606,9 +754,8 @@ def run_cmd_callback(model: str, prompt: Optional[str], system: Optional[str], s
                 gen_time = time.time() - gen_start
                 tokens_generated += token_count
                 
-                # Show generation stats
-                if gen_time > 0:
-                    console.print(f"[dim]{token_count} tokens in {gen_time:.1f}s ({token_count/gen_time:.1f} tok/s)[/dim]")
+                # Generation stats (hidden from users, kept for internal tracking)
+                # Debug mode would show: f"{token_count} tokens in {gen_time:.1f}s ({token_count/gen_time:.1f} tok/s)"
                 
                 # Check for runtime optimization recommendations
                 try:
