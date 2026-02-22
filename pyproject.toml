@@ -1,0 +1,107 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zllm"
+version = "0.1.0"
+description = "Memory-efficient LLM inference engine for everyone. Run large models on limited hardware."
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+    { name = "zllm Team" }
+]
+keywords = [
+    "llm",
+    "inference",
+    "machine-learning",
+    "transformers",
+    "memory-efficient",
+    "quantization",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "safetensors>=0.4.0",
+    "transformers>=4.35.0",
+    "huggingface-hub>=0.19.0",
+    "accelerate>=0.25.0",
+    "tokenizers>=0.15.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "rich>=13.0.0",
+    "click>=8.1.0",
+    "httpx>=0.25.0",
+    "sentence-transformers>=2.2.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.66.0",
+    "aiosqlite>=0.19.0",
+    "python-multipart>=0.0.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+    "pre-commit>=3.5.0",
+]
+cuda = [
+    "bitsandbytes>=0.41.0",
+    "auto-gptq>=0.5.0",
+    "autoawq>=0.1.0",
+]
+build = [
+    "pyinstaller>=6.0.0",
+    "nuitka>=1.8.0",
+]
+all = [
+    "zllm[dev,cuda,build]",
+]
+
+[project.scripts]
+zllm = "zllm.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/zllm/zllm"
+Documentation = "https://zllm.dev/docs"
+Repository = "https://github.com/zllm/zllm"
+
+[tool.hatch.build.targets.wheel]
+packages = ["zllm"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
