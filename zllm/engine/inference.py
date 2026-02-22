@@ -442,25 +442,20 @@ class ZLLMInferenceEngine:
         1. If layer_streaming disabled OR all layers fit: load all to GPU
         2. Otherwise: load only hot layers to GPU, rest to CPU
         """
-        if not self.config.layer_streaming or self._max_gpu_layers >= self.num_layers:
-            # Load all layers to GPU (legacy mode)
-            print("Loading all layers to GPU...")
-            for i in range(self.num_layers):
-                layer = self._create_and_load_layer(i)
-                layer = layer.to(self.device)
-                self._gpu_layers[i] = layer
-            print(f"Loaded {len(self._gpu_layers)} layers to GPU")
-        else:
-            # Layer streaming mode - load hot layers to GPU, rest to CPU
-            print(f"Layer streaming: loading {len(self._hot_layers)} hot layers to GPU...")
-            
-            # First, load all layers to CPU
-            for i in range(self.num_layers):
-                layer = self._create_and_load_layer(i)
-                self._cpu_layers[i] = layer.cpu()
-            
-            # Then move hot layers to GPU (up to budget)
+        # ALWAYS load layers to CPU first (key for memory efficiency)
+        print(f"Loading {self.num_layers} layers to CPU...")
+        for i in range(self.num_layers):
+            layer = self._create_and_load_layer(i, device="cpu")
+            self._cpu_layers[i] = layer
+            if (i + 1) % 5 == 0:
+                print(f"  Loaded {i + 1}/{self.num_layers} layers to CPU")
+        
+        # Now move hot layers to GPU based on budget
+        if self._max_gpu_layers > 0:
+            print(f"Moving up to {self._max_gpu_layers} hot layers to GPU...")
             loaded_to_gpu = 0
+            
+            # Prioritize hot (middle) layers
             for i in sorted(self._hot_layers):
                 if loaded_to_gpu >= self._max_gpu_layers:
                     break
@@ -468,7 +463,16 @@ class ZLLMInferenceEngine:
                 self._gpu_layers[i] = layer.to(self.device)
                 loaded_to_gpu += 1
             
-            print(f"GPU: {len(self._gpu_layers)} layers, CPU: {len(self._cpu_layers)} layers")
+            # If we have room, add early layers (0, 1, 2)
+            for i in range(3):
+                if loaded_to_gpu >= self._max_gpu_layers:
+                    break
+                if i in self._cpu_layers:
+                    layer = self._cpu_layers.pop(i)
+                    self._gpu_layers[i] = layer.to(self.device)
+                    loaded_to_gpu += 1
+        
+        print(f"GPU: {len(self._gpu_layers)} layers, CPU: {len(self._cpu_layers)} layers")
     
     def _get_layer(self, layer_idx: int) -> TransformerLayer:
         """
@@ -568,8 +572,13 @@ class ZLLMInferenceEngine:
         finally:
             self._prefetch_futures.pop(layer_idx, None)
     
-    def _create_and_load_layer(self, layer_idx: int) -> TransformerLayer:
-        """Create a TransformerLayer and load weights from GGUF."""
+    def _create_and_load_layer(self, layer_idx: int, device: str = "cpu") -> TransformerLayer:
+        """Create a TransformerLayer and load weights from GGUF.
+        
+        Args:
+            layer_idx: Layer index
+            device: Device to load weights to (default: "cpu" for streaming)
+        """
         layer = TransformerLayer(
             hidden_size=self.hidden_size,
             num_heads=self.num_heads,
@@ -587,38 +596,44 @@ class ZLLMInferenceEngine:
         down_shape = (self.hidden_size, self.intermediate_size)
         
         # Load weights - try different naming conventions
+        # ALWAYS load to specified device (CPU for streaming mode)
         prefix = f"model.layers.{layer_idx}"
         
         try:
             # HuggingFace naming
-            layer.input_layernorm.weight.data = self._load_tensor(f"{prefix}.input_layernorm.weight")
-            layer.q_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.q_proj.weight", q_shape)
-            layer.k_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.k_proj.weight", k_shape)
-            layer.v_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.v_proj.weight", v_shape)
-            layer.o_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.o_proj.weight", o_shape)
-            layer.post_attention_layernorm.weight.data = self._load_tensor(f"{prefix}.post_attention_layernorm.weight")
-            layer.gate_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.gate_proj.weight", gate_shape)
-            layer.up_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.up_proj.weight", up_shape)
-            layer.down_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.down_proj.weight", down_shape)
+            layer.input_layernorm.weight.data = self._load_tensor(f"{prefix}.input_layernorm.weight", device=device)
+            layer.q_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.q_proj.weight", q_shape, device=device)
+            layer.k_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.k_proj.weight", k_shape, device=device)
+            layer.v_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.v_proj.weight", v_shape, device=device)
+            layer.o_proj.weight.data = self._load_linear_weight(f"{prefix}.self_attn.o_proj.weight", o_shape, device=device)
+            layer.post_attention_layernorm.weight.data = self._load_tensor(f"{prefix}.post_attention_layernorm.weight", device=device)
+            layer.gate_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.gate_proj.weight", gate_shape, device=device)
+            layer.up_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.up_proj.weight", up_shape, device=device)
+            layer.down_proj.weight.data = self._load_linear_weight(f"{prefix}.mlp.down_proj.weight", down_shape, device=device)
         except KeyError:
             # Try llama.cpp naming (blk.N.*)
             try:
-                layer.input_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_norm.weight")
-                layer.q_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_q.weight", q_shape)
-                layer.k_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_k.weight", k_shape)
-                layer.v_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_v.weight", v_shape)
-                layer.o_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_output.weight", o_shape)
-                layer.post_attention_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_norm.weight")
-                layer.gate_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_gate.weight", gate_shape)
-                layer.up_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_up.weight", up_shape)
-                layer.down_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_down.weight", down_shape)
+                layer.input_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.attn_norm.weight", device=device)
+                layer.q_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_q.weight", q_shape, device=device)
+                layer.k_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_k.weight", k_shape, device=device)
+                layer.v_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_v.weight", v_shape, device=device)
+                layer.o_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.attn_output.weight", o_shape, device=device)
+                layer.post_attention_layernorm.weight.data = self._load_tensor(f"blk.{layer_idx}.ffn_norm.weight", device=device)
+                layer.gate_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_gate.weight", gate_shape, device=device)
+                layer.up_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_up.weight", up_shape, device=device)
+                layer.down_proj.weight.data = self._load_linear_weight(f"blk.{layer_idx}.ffn_down.weight", down_shape, device=device)
             except KeyError as e:
                 raise KeyError(f"Cannot load layer {layer_idx}: {e}")
         
-        return layer.to(self.dtype)
+        return layer.to(device).to(self.dtype)
 
-    def _load_tensor(self, name: str) -> torch.Tensor:
-        """Load a tensor from GGUF file."""
+    def _load_tensor(self, name: str, device: str = None) -> torch.Tensor:
+        """Load a tensor from GGUF file.
+        
+        Args:
+            name: Tensor name
+            device: Target device (default: self.device)
+        """
         if name not in self.parser.tensors:
             # Try common name variations
             variations = [
@@ -633,15 +648,16 @@ class ZLLMInferenceEngine:
             else:
                 raise KeyError(f"Tensor not found: {name}")
         
-        return self.parser.load_tensor(name, self.device).to(self.dtype)
+        target_device = device if device is not None else self.device
+        return self.parser.load_tensor(name, target_device).to(self.dtype)
     
-    def _load_linear_weight(self, name: str, expected_shape: tuple) -> torch.Tensor:
+    def _load_linear_weight(self, name: str, expected_shape: tuple, device: str = None) -> torch.Tensor:
         """Load a Linear layer weight from GGUF.
         
         GGUF shape is already corrected in load_tensor() to PyTorch convention:
         (out_features, in_features) - no transpose needed.
         """
-        weight = self._load_tensor(name)
+        weight = self._load_tensor(name, device=device)
         
         # Verify shape matches expected
         if weight.shape != expected_shape:
